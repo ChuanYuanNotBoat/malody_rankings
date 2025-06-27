@@ -1,0 +1,23 @@
+# malody_rankings 项目依赖
+
+# 网络请求库
+requests==2.31.0
+
+# HTML 解析库
+beautifulsoup4==4.12.3
+
+# 数据处理库
+pandas==2.2.2
+
+# Excel 文件处理
+openpyxl==3.1.2
+
+# 日期时间处理
+python-dateutil==2.9.0.post0
+
+# SSL/TLS 支持
+pyOpenSSL==24.1.0
+cryptography==42.0.8
+
+# 重试机制
+urllib3==2.2.1
