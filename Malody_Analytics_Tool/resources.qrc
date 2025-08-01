@@ -1,0 +1,11 @@
+<RCC>
+  <qresource prefix="/">
+    <!-- 图标资源 -->
+    <file>icons/app_icon.png</file>
+    <file>icons/open.png</file>
+    <file>icons/save.png</file>
+
+    <!-- 翻译文件 -->
+    <file>translations/malody_zh_CN.qm</file>
+  </qresource>
+</RCC>
