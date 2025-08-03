@@ -1,85 +1,92 @@
 # ui/main_window.py
 import os
 import logging
+import pandas as pd  # 添加 pandas 导入
+from openpyxl import load_workbook  # 添加 openpyxl 导入
 from PyQt5.QtWidgets import (
-  QMainWindow, QAction, QActionGroup, QMessageBox,
-  QFileDialog, QStatusBar, QLabel, QVBoxLayout, QWidget, QApplication,
-  QTabWidget, QDateEdit, QHBoxLayout, QPushButton, QTableWidget,
-  QTableWidgetItem, QHeaderView, QComboBox
+    QMainWindow, QAction, QActionGroup, QMessageBox,
+    QFileDialog, QStatusBar, QLabel, QVBoxLayout, QWidget, QApplication,
+    QTabWidget, QDateEdit, QHBoxLayout, QPushButton, QTableWidget,
+    QTableWidgetItem, QHeaderView, QComboBox, QProgressBar  # 添加 QProgressBar
 )
-from PyQt5.QtCore import QSettings, QEvent, QTranslator, Qt, QDateTime
+from PyQt5.QtCore import QSettings, QEvent, QTranslator, Qt, QDateTime, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
-from utils.i18n import get_system_language
-from core.analytics import analyze_malody_folder
+from core.analytics import analyze_malody_folder, MODE_FILES, get_latest_sheet_data, analyze_mode_data
 from core.history_analyzer import get_player_history, get_all_players_growth
 from widgets.chart_widget import ChartWidget
 from widgets.history_chart import HistoryChartWidget
-import pandas as pd
-from openpyxl import load_workbook
-from core.analytics import MODE_FILES
-from PyQt5.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
 
-# 添加历史数据获取线程
+# ================= 后台线程类 =================
+class AnalysisThread(QThread):
+  finished = pyqtSignal(dict)
+  error = pyqtSignal(str)
+  progress = pyqtSignal(int, int)  # 当前模式, 总模式数
+
+  def __init__(self, folder_path):
+    super().__init__()
+    self.folder_path = folder_path
+
+  def run(self):
+    try:
+      results = {}
+      modes = list(MODE_FILES.keys())
+      total = len(modes)
+
+      for i, mode in enumerate(modes):
+        self.progress.emit(i + 1, total)
+        file_path = os.path.join(self.folder_path, MODE_FILES[mode])
+
+        if not os.path.exists(file_path):
+          continue
+
+        try:
+          df = get_latest_sheet_data(file_path)
+          if not df.empty:
+            mode_results = analyze_mode_data(df, mode)
+            results[mode] = mode_results
+        except Exception as e:
+          logger.error(f"Error analyzing mode {mode}: {str(e)}")
+
+      self.finished.emit(results)
+    except Exception as e:
+      self.error.emit(str(e))
+
+
 class HistoryThread(QThread):
   finished = pyqtSignal(str, list)  # 玩家名称, 历史数据
   error = pyqtSignal(str)
 
-  def __init__(self, folder_path, player_name, start_date, end_date):
+  def __init__(self, folder_path, player_name, start_date, end_date, max_points=500):
     super().__init__()
     self.folder_path = folder_path
     self.player_name = player_name
     self.start_date = start_date
     self.end_date = end_date
+    self.max_points = max_points
 
   def run(self):
     try:
       history = get_player_history(self.folder_path, self.player_name)
+
       # 过滤日期范围
       filtered_history = [
         h for h in history
         if h['date'].date() >= self.start_date and h['date'].date() <= self.end_date
       ]
+
+      # 如果数据点太多，进行采样
+      if len(filtered_history) > self.max_points:
+        step = max(1, len(filtered_history) // self.max_points)
+        filtered_history = filtered_history[::step]
+
       self.finished.emit(self.player_name, filtered_history)
     except Exception as e:
       self.error.emit(str(e))
 
 
-# 在 MainWindow 类中修改 refresh_player_history 方法
-def refresh_player_history(self):
-  """刷新玩家历史数据"""
-  if not self.folder_path or self.player_combo.count() == 0:
-    return
-
-  player_name = self.player_combo.currentText()
-  start_date = self.start_date_edit.date().toPyDate()
-  end_date = self.end_date_edit.date().toPyDate()
-
-  self.status_label.setText(self.tr("Loading history for {}...").format(player_name))
-  self.refresh_btn.setEnabled(False)  # 禁用刷新按钮
-
-  # 创建并启动历史数据线程
-  self.history_thread = HistoryThread(self.folder_path, player_name, start_date, end_date)
-  self.history_thread.finished.connect(self.on_history_finished)
-  self.history_thread.error.connect(self.on_history_error)
-  self.history_thread.start()
-
-
-def on_history_finished(self, player_name, history):
-  self.refresh_btn.setEnabled(True)
-  self.history_chart.set_history_data(player_name, history)
-  self.status_label.setText(self.tr("History loaded for {}").format(player_name))
-
-
-def on_history_error(self, error_msg):
-  self.refresh_btn.setEnabled(True)
-  QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load history: {}").format(error_msg))
-  self.status_label.setText(self.tr("Ready"))
-
-
-# 添加成长数据获取线程
 class GrowthThread(QThread):
   finished = pyqtSignal(dict)  # 成长数据
   error = pyqtSignal(str)
@@ -98,53 +105,7 @@ class GrowthThread(QThread):
       self.error.emit(str(e))
 
 
-# 在 MainWindow 类中修改 refresh_growth_data 方法
-def refresh_growth_data(self):
-  """刷新玩家成长数据"""
-  if not self.folder_path:
-    return
-
-  start_date = self.start_date_edit.date().toPyDate()
-  end_date = self.end_date_edit.date().toPyDate()
-
-  self.status_label.setText(self.tr("Calculating player growth..."))
-  self.refresh_growth_btn.setEnabled(False)  # 禁用刷新按钮
-
-  # 创建并启动成长数据线程
-  self.growth_thread = GrowthThread(self.folder_path, start_date, end_date)
-  self.growth_thread.finished.connect(self.on_growth_finished)
-  self.growth_thread.error.connect(self.on_growth_error)
-  self.growth_thread.start()
-
-
-def on_growth_finished(self, growth_data):
-  self.refresh_growth_btn.setEnabled(True)
-  self.player_growth_data = growth_data
-  self.update_growth_table()
-  self.status_label.setText(self.tr("Growth data updated"))
-
-
-def on_growth_error(self, error_msg):
-  self.refresh_growth_btn.setEnabled(True)
-  QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to calculate growth: {}").format(error_msg))
-  self.status_label.setText(self.tr("Ready"))
-
-
-class AnalysisThread(QThread):
-  finished = pyqtSignal(dict)
-  error = pyqtSignal(str)
-
-  def __init__(self, folder_path):
-    super().__init__()
-    self.folder_path = folder_path
-
-  def run(self):
-    try:
-      results = analyze_malody_folder(self.folder_path)
-      self.finished.emit(results)
-    except Exception as e:
-      self.error.emit(str(e))
-
+# ================= 主窗口类 =================
 class MainWindow(QMainWindow):
   def __init__(self, translator):
     super().__init__()
@@ -175,6 +136,12 @@ class MainWindow(QMainWindow):
     self.setStatusBar(self.status_bar)
     self.status_label = QLabel(self.tr("Ready"))
     self.status_bar.addWidget(self.status_label)
+
+    # 添加进度条
+    self.progress_bar = QProgressBar()
+    self.progress_bar.setMaximum(100)
+    self.progress_bar.setVisible(False)
+    self.status_bar.addPermanentWidget(self.progress_bar)
 
     # 创建主内容区域
     self.main_widget = QTabWidget()
@@ -338,6 +305,11 @@ class MainWindow(QMainWindow):
 
   def set_language(self, lang_code, initial_load=False):
     """设置应用程序语言"""
+    # 如果语言没有变化，直接返回
+    current_lang = self.settings.value("language", "")
+    if current_lang == lang_code and not initial_load:
+      return
+
     # 更新UI选择状态
     if lang_code == 'zh_CN':
       self.chinese_action.setChecked(True)
@@ -386,9 +358,10 @@ class MainWindow(QMainWindow):
     # 触发语言更改事件
     self.retranslate_ui()
 
-    # 发送语言变更事件，通知所有UI元素更新
-    event = QEvent(QEvent.LanguageChange)
-    QApplication.sendEvent(self, event)
+    # 只有在语言实际变更时才发送事件
+    if current_lang != lang_code:
+      event = QEvent(QEvent.LanguageChange)
+      QApplication.sendEvent(self, event)
 
     # 更新图表控件
     self.chart_widget.retranslate_ui()
@@ -461,15 +434,48 @@ class MainWindow(QMainWindow):
     if folder_path:
       self.folder_path = folder_path
       self.status_label.setText(self.tr("Processing folder..."))
+      self.progress_bar.setVisible(True)
+      self.progress_bar.setValue(0)
 
-      # 禁用打开按钮，防止重复操作
+      # 禁用打开按钮
       self.open_action.setEnabled(False)
 
       # 创建并启动分析线程
       self.analysis_thread = AnalysisThread(folder_path)
       self.analysis_thread.finished.connect(self.on_analysis_finished)
       self.analysis_thread.error.connect(self.on_analysis_error)
+      self.analysis_thread.progress.connect(self.on_analysis_progress)
       self.analysis_thread.start()
+
+  def on_analysis_progress(self, current, total):
+    """更新分析进度"""
+    progress = int(current / total * 100)
+    self.progress_bar.setValue(progress)
+    self.status_label.setText(
+      self.tr("Processing mode {}/{}...").format(current, total)
+    )
+
+  def on_analysis_finished(self, results):
+    """分析完成后的处理"""
+    self.open_action.setEnabled(True)
+    self.progress_bar.setVisible(False)
+
+    # 更新图表
+    self.chart_widget.update_chart(results)
+    self.status_label.setText(self.tr("Analysis completed for {} modes").format(len(results)))
+
+    # 加载玩家列表
+    self.load_player_list()
+
+    # 加载成长数据
+    self.refresh_growth_data()
+
+  def on_analysis_error(self, error_msg):
+    """分析出错的处理"""
+    self.open_action.setEnabled(True)
+    self.progress_bar.setVisible(False)
+    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to process folder: {}").format(error_msg))
+    self.status_label.setText(self.tr("Ready"))
 
   def save_report(self):
     """保存分析报告"""
@@ -512,7 +518,8 @@ class MainWindow(QMainWindow):
 
           df = pd.read_excel(file_path, sheet_name=sheet_name)
           all_players.update(df['name'].unique())
-      except:
+      except Exception as e:
+        logger.error(f"Error loading players from {file_path}: {str(e)}")
         continue
 
     # 更新玩家下拉框
@@ -539,23 +546,29 @@ class MainWindow(QMainWindow):
     end_date = self.end_date_edit.date().toPyDate()
 
     self.status_label.setText(self.tr("Loading history for {}...").format(player_name))
+    self.refresh_btn.setEnabled(False)
 
-    try:
-      # 获取玩家历史数据
-      history = get_player_history(self.folder_path, player_name)
+    # 创建并启动历史数据线程
+    self.history_thread = HistoryThread(
+      self.folder_path,
+      player_name,
+      start_date,
+      end_date,
+      max_points=500  # 限制最多500个数据点
+    )
+    self.history_thread.finished.connect(self.on_history_finished)
+    self.history_thread.error.connect(self.on_history_error)
+    self.history_thread.start()
 
-      # 过滤日期范围
-      filtered_history = [
-        h for h in history
-        if h['date'].date() >= start_date and h['date'].date() <= end_date
-      ]
+  def on_history_finished(self, player_name, history):
+    self.refresh_btn.setEnabled(True)
+    self.history_chart.set_history_data(player_name, history)
+    self.status_label.setText(self.tr("History loaded for {}").format(player_name))
 
-      # 更新图表
-      self.history_chart.set_history_data(player_name, filtered_history)
-      self.status_label.setText(self.tr("History loaded for {}").format(player_name))
-    except Exception as e:
-      QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load history: {}").format(str(e)))
-      self.status_label.setText(self.tr("Ready"))
+  def on_history_error(self, error_msg):
+    self.refresh_btn.setEnabled(True)
+    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load history: {}").format(error_msg))
+    self.status_label.setText(self.tr("Ready"))
 
   def refresh_growth_data(self):
     """刷新玩家成长数据"""
@@ -566,17 +579,24 @@ class MainWindow(QMainWindow):
     end_date = self.end_date_edit.date().toPyDate()
 
     self.status_label.setText(self.tr("Calculating player growth..."))
+    self.refresh_growth_btn.setEnabled(False)
 
-    try:
-      # 获取所有玩家成长数据
-      self.player_growth_data = get_all_players_growth(self.folder_path, start_date, end_date)
+    # 创建并启动成长数据线程
+    self.growth_thread = GrowthThread(self.folder_path, start_date, end_date)
+    self.growth_thread.finished.connect(self.on_growth_finished)
+    self.growth_thread.error.connect(self.on_growth_error)
+    self.growth_thread.start()
 
-      # 更新表格
-      self.update_growth_table()
-      self.status_label.setText(self.tr("Growth data updated"))
-    except Exception as e:
-      QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to calculate growth: {}").format(str(e)))
-      self.status_label.setText(self.tr("Ready"))
+  def on_growth_finished(self, growth_data):
+    self.refresh_growth_btn.setEnabled(True)
+    self.player_growth_data = growth_data
+    self.update_growth_table()
+    self.status_label.setText(self.tr("Growth data updated"))
+
+  def on_growth_error(self, error_msg):
+    self.refresh_growth_btn.setEnabled(True)
+    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to calculate growth: {}").format(error_msg))
+    self.status_label.setText(self.tr("Ready"))
 
   def update_growth_table(self):
     """更新成长数据表格"""
@@ -624,25 +644,3 @@ class MainWindow(QMainWindow):
       self.growth_table.setItem(row, 5, QTableWidgetItem(str(item['daily_exp_growth'])))
       self.growth_table.setItem(row, 6, QTableWidgetItem(item['period']))
       self.growth_table.setItem(row, 7, QTableWidgetItem(str(item['days'])))
-
-  def on_analysis_finished(self, results):
-      """分析完成后的处理"""
-      # 启用打开按钮
-      self.open_action.setEnabled(True)
-
-      # 更新图表
-      self.chart_widget.update_chart(results)
-      self.status_label.setText(self.tr("Analysis completed for {} modes").format(len(results)))
-
-      # 加载玩家列表
-      self.load_player_list()
-
-      # 加载成长数据
-      self.refresh_growth_data()
-
-  def on_analysis_error(self, error_msg):
-    """分析出错的处理"""
-    # 启用打开按钮
-    self.open_action.setEnabled(True)
-    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to process folder: {}").format(error_msg))
-    self.status_label.setText(self.tr("Ready"))

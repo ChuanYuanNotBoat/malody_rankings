@@ -1,10 +1,8 @@
-# widgets/history_chart.py
 import logging
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QDateEdit, QPushButton
 from PyQt5.QtChart import QChart, QChartView, QLineSeries, QValueAxis, QDateTimeAxis
-from PyQt5.QtCore import Qt, QDateTime
+from PyQt5.QtCore import Qt, QDateTime, QTimer
 from PyQt5.QtGui import QPainter, QColor, QBrush, QPen
-from PyQt5.QtCore import QPointF
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +13,7 @@ class HistoryChartWidget(QWidget):
     self.player_history = []
     self.player_name = ""
     self.init_ui()
+    self.chunk_size = 100  # 每次加载的数据点数
 
   def init_ui(self):
     # 主布局
@@ -94,8 +93,12 @@ class HistoryChartWidget(QWidget):
     pass
 
   def update_chart(self):
-    """更新图表"""
+    """分块更新图表以避免UI冻结"""
+    # 清除现有系列和定时器
     self.chart.removeAllSeries()
+
+    if hasattr(self, 'timer') and self.timer.isActive():
+      self.timer.stop()
 
     if not self.player_history:
       self.chart.setTitle(self.tr("No Data Available"))
@@ -105,75 +108,96 @@ class HistoryChartWidget(QWidget):
     self.chart.setTitle(self.tr("Player History: {}").format(self.player_name))
 
     # 创建数据系列
-    rank_series = QLineSeries()
-    rank_series.setName(self.tr("Rank"))
-    rank_series.setColor(QColor(220, 53, 69))  # 红色
+    self.rank_series = QLineSeries()
+    self.rank_series.setName(self.tr("Rank"))
+    self.rank_series.setColor(QColor(220, 53, 69))  # 红色
 
-    lv_series = QLineSeries()
-    lv_series.setName(self.tr("Level"))
-    lv_series.setColor(QColor(40, 167, 69))  # 绿色
+    self.lv_series = QLineSeries()
+    self.lv_series.setName(self.tr("Level"))
+    self.lv_series.setColor(QColor(40, 167, 69))  # 绿色
 
-    exp_series = QLineSeries()
-    exp_series.setName(self.tr("Experience"))
-    exp_series.setColor(QColor(0, 123, 255))  # 蓝色
+    self.exp_series = QLineSeries()
+    self.exp_series.setName(self.tr("Experience"))
+    self.exp_series.setColor(QColor(0, 123, 255))  # 蓝色
 
-    pc_series = QLineSeries()
-    pc_series.setName(self.tr("Play Count"))
-    pc_series.setColor(QColor(255, 193, 7))  # 黄色
+    self.pc_series = QLineSeries()
+    self.pc_series.setName(self.tr("Play Count"))
+    self.pc_series.setColor(QColor(255, 193, 7))  # 黄色
 
-    # 添加数据点
-    min_date = None
-    max_date = None
+    # 添加系列到图表
+    self.chart.addSeries(self.rank_series)
+    self.chart.addSeries(self.lv_series)
+    self.chart.addSeries(self.exp_series)
+    self.chart.addSeries(self.pc_series)
 
-    for data in self.player_history:
+    # 创建X轴（时间）
+    self.axis_x = QDateTimeAxis()
+    self.axis_x.setFormat("yyyy-MM-dd")
+    self.axis_x.setTitleText(self.tr("Date"))
+    self.chart.addAxis(self.axis_x, Qt.AlignBottom)
+
+    # 创建Y轴（数值）
+    self.axis_y = QValueAxis()
+    self.axis_y.setTitleText(self.tr("Value"))
+    self.chart.addAxis(self.axis_y, Qt.AlignLeft)
+
+    # 初始化分块加载
+    self.current_index = 0
+    self.min_date = None
+    self.max_date = None
+
+    # 设置定时器分块加载数据
+    self.timer = QTimer()
+    self.timer.timeout.connect(self.add_data_chunk)
+    self.timer.start(50)  # 每50ms加载一个数据块
+
+  def add_data_chunk(self):
+    """添加一块数据点"""
+    if self.current_index >= len(self.player_history):
+      # 所有数据加载完成
+      self.timer.stop()
+
+      # 设置坐标轴范围
+      if self.min_date and self.max_date:
+        self.axis_x.setRange(QDateTime(self.min_date), QDateTime(self.max_date))
+
+      # 附加系列到坐标轴
+      for series in [self.rank_series, self.lv_series, self.exp_series, self.pc_series]:
+        series.attachAxis(self.axis_x)
+        series.attachAxis(self.axis_y)
+
+      return
+
+    # 确定当前块的范围
+    end_index = min(self.current_index + self.chunk_size, len(self.player_history))
+
+    # 添加当前块的数据点
+    for i in range(self.current_index, end_index):
+      data = self.player_history[i]
       date = data['date']
       qt_date = QDateTime(date)
 
       # 记录最小和最大日期
-      if min_date is None or date < min_date:
-        min_date = date
-      if max_date is None or date > max_date:
-        max_date = date
+      if self.min_date is None or date < self.min_date:
+        self.min_date = date
+      if self.max_date is None or date > self.max_date:
+        self.max_date = date
 
       # 添加数据点
       if 'rank' in data and data['rank'] is not None:
-        rank_series.append(qt_date.toMSecsSinceEpoch(), data['rank'])
+        self.rank_series.append(qt_date.toMSecsSinceEpoch(), data['rank'])
 
       if 'lv' in data and data['lv'] is not None:
-        lv_series.append(qt_date.toMSecsSinceEpoch(), data['lv'])
+        self.lv_series.append(qt_date.toMSecsSinceEpoch(), data['lv'])
 
       if 'exp' in data and data['exp'] is not None:
-        exp_series.append(qt_date.toMSecsSinceEpoch(), data['exp'])
+        self.exp_series.append(qt_date.toMSecsSinceEpoch(), data['exp'])
 
       if 'pc' in data and data['pc'] is not None:
-        pc_series.append(qt_date.toMSecsSinceEpoch(), data['pc'])
+        self.pc_series.append(qt_date.toMSecsSinceEpoch(), data['pc'])
 
-    # 添加系列到图表
-    self.chart.addSeries(rank_series)
-    self.chart.addSeries(lv_series)
-    self.chart.addSeries(exp_series)
-    self.chart.addSeries(pc_series)
-
-    # 创建X轴（时间）
-    axis_x = QDateTimeAxis()
-    axis_x.setFormat("yyyy-MM-dd")
-    axis_x.setTitleText(self.tr("Date"))
-    axis_x.setRange(QDateTime(min_date), QDateTime(max_date))
-    self.chart.addAxis(axis_x, Qt.AlignBottom)
-
-    # 创建Y轴（数值）
-    axis_y = QValueAxis()
-    axis_y.setTitleText(self.tr("Value"))
-    self.chart.addAxis(axis_y, Qt.AlignLeft)
-
-    # 将系列附加到轴
-    for series in [rank_series, lv_series, exp_series, pc_series]:
-      series.attachAxis(axis_x)
-      series.attachAxis(axis_y)
-
-    # 添加悬停效果
-    for series in [rank_series, lv_series, exp_series, pc_series]:
-      series.hovered.connect(self.on_series_hovered)
+    # 更新索引
+    self.current_index = end_index
 
   def on_series_hovered(self, point, state):
     """系列悬停事件"""

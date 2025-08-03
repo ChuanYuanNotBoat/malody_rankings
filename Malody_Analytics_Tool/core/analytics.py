@@ -1,11 +1,11 @@
-# core/analytics.py
 import os
 import pandas as pd
 from datetime import datetime
 from openpyxl import load_workbook
 import logging
-logger = logging.getLogger(__name__)
 
+# 添加logger定义
+logger = logging.getLogger(__name__)
 
 # 模式文件命名规则
 MODE_FILES = {
@@ -34,12 +34,12 @@ def get_latest_sheet_data(file_path):
       continue
 
     try:
-      # 新逻辑：直接提取模式和时间部分
+      # 提取时间部分
       parts = sheet.split('_')
       if len(parts) < 3:
         continue
 
-      # 提取时间字符串（最后两部分）
+      # 最后两部分是日期和时间
       time_str = f"{parts[-2]}_{parts[-1]}"
       dt = datetime.strptime(time_str, "%Y-%m-%d_%H-%M")
       sheets_with_time.append((dt, sheet))
@@ -58,6 +58,7 @@ def get_latest_sheet_data(file_path):
 
 
 def analyze_mode_data(df, mode):
+  """分析一个模式的数据，返回结果字典"""
   if df.empty:
     logger.warning(f"No data found for mode {mode}")
     return {}
@@ -88,8 +89,9 @@ def analyze_mode_data(df, mode):
 
 
 def analyze_malody_folder(folder_path):
-  """分析文件夹中的所有模式文件"""
+  """分析文件夹中的所有Malody模式文件"""
   results = {}
+  logger.info(f"Analyzing Malody folder: {folder_path}")
 
   for mode, filename in MODE_FILES.items():
     file_path = os.path.join(folder_path, filename)

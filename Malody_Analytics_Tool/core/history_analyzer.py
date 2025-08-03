@@ -1,10 +1,10 @@
-# core/history_analyzer.py
 import os
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from openpyxl import load_workbook
 import logging
-import numpy as np
+
+# 从analytics导入MODE_FILES
 from core.analytics import MODE_FILES
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ def parse_sheet_date(sheet_name):
     if len(parts) >= 3:
       date_str = parts[-2] + '_' + parts[-1]
       return datetime.strptime(date_str, "%Y-%m-%d_%H-%M")
-  except:
+  except Exception:
     return None
   return None
 
@@ -119,7 +119,8 @@ def get_all_players_growth(folder_path, start_date=None, end_date=None):
 
         df = pd.read_excel(file_path, sheet_name=sheet_name)
         all_players.update(df['name'].unique())
-    except:
+    except Exception as e:
+      logger.error(f"Error processing {file_path}: {str(e)}")
       continue
 
   # 计算每个玩家的成长
@@ -130,4 +131,3 @@ def get_all_players_growth(folder_path, start_date=None, end_date=None):
       player_growth[player] = growth
 
   return player_growth
-
