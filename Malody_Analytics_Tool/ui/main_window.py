@@ -4,10 +4,10 @@ import logging
 import pandas as pd
 from openpyxl import load_workbook
 from PyQt5.QtWidgets import (
-    QMainWindow, QAction, QActionGroup, QMessageBox,
-    QFileDialog, QStatusBar, QLabel, QVBoxLayout, QWidget, QApplication,
-    QTabWidget, QDateEdit, QHBoxLayout, QPushButton, QTableWidget,
-    QTableWidgetItem, QHeaderView, QComboBox, QProgressBar
+  QMainWindow, QAction, QActionGroup, QMessageBox,
+  QFileDialog, QStatusBar, QLabel, QVBoxLayout, QWidget, QApplication,
+  QTabWidget, QDateEdit, QHBoxLayout, QPushButton, QTableWidget,
+  QTableWidgetItem, QHeaderView, QComboBox, QProgressBar
 )
 from PyQt5.QtCore import QSettings, QEvent, QTranslator, Qt, QDateTime, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -22,8 +22,7 @@ logger = logging.getLogger(__name__)
 # ================= 后台线程类 =================
 class ModeAnalysisThread(QThread):
   finished = pyqtSignal(int, dict)  # 模式, 分析结果
-  error = pyqtSignal(int, str)      # 模式, 错误信息
-  progress = pyqtSignal(int, int)   # 当前模式, 总模式数
+  error = pyqtSignal(int, str)  # 模式, 错误信息
 
   def __init__(self, mode, file_path):
     super().__init__()
@@ -97,6 +96,39 @@ class GrowthThread(QThread):
       self.error.emit(str(e))
 
 
+class PlayerListThread(QThread):
+  finished = pyqtSignal(set)  # 玩家列表
+  error = pyqtSignal(str)
+
+  def __init__(self, folder_path):
+    super().__init__()
+    self.folder_path = folder_path
+
+  def run(self):
+    try:
+      all_players = set()
+      for mode in MODE_FILES.keys():
+        file_path = os.path.join(self.folder_path, MODE_FILES[mode])
+        if not os.path.exists(file_path):
+          continue
+
+        try:
+          wb = load_workbook(file_path)
+          for sheet_name in wb.sheetnames:
+            if not sheet_name.startswith(f"mode_{mode}_"):
+              continue
+
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            all_players.update(df['name'].unique())
+        except Exception as e:
+          logger.error(f"Error loading players from {file_path}: {str(e)}")
+          continue
+
+      self.finished.emit(all_players)
+    except Exception as e:
+      self.error.emit(str(e))
+
+
 # ================= 主窗口类 =================
 class MainWindow(QMainWindow):
   def __init__(self, translator):
@@ -115,7 +147,7 @@ class MainWindow(QMainWindow):
     self.setWindowTitle(self.tr("Malody Analytics Tool"))
     self.setWindowIcon(QIcon(":/icons/app_icon.png"))
     self.setGeometry(100, 100, 1200, 800)
-    self.chart_widget.mode_combo.currentIndexChanged.connect(self.on_mode_selected)
+
     # 创建菜单栏
     self.create_menus()
 
@@ -134,6 +166,104 @@ class MainWindow(QMainWindow):
     # 创建主内容区域
     self.main_widget = QTabWidget()
     self.setCentralWidget(self.main_widget)
+
+    # 模式分析标签页
+    self.mode_tab = QWidget()
+    self.mode_layout = QVBoxLayout(self.mode_tab)
+
+    # 创建图表控件
+    self.chart_widget = ChartWidget()
+    self.mode_layout.addWidget(self.chart_widget)
+    self.main_widget.addTab(self.mode_tab, self.tr("Mode Analysis"))
+
+    # 玩家历史分析标签页
+    self.history_tab = QWidget()
+    self.history_layout = QVBoxLayout(self.history_tab)
+
+    # 玩家选择控件
+    player_control_layout = QHBoxLayout()
+    self.history_layout.addLayout(player_control_layout)
+
+    player_control_layout.addWidget(QLabel(self.tr("Select Player:")))
+    self.player_combo = QComboBox()
+    self.player_combo.currentIndexChanged.connect(self.on_player_changed)
+    player_control_layout.addWidget(self.player_combo)
+
+    # 日期范围控件
+    date_control_layout = QHBoxLayout()
+    self.history_layout.addLayout(date_control_layout)
+
+    date_control_layout.addWidget(QLabel(self.tr("Date Range:")))
+    self.start_date_edit = QDateEdit()
+    self.start_date_edit.setCalendarPopup(True)
+    self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+    self.start_date_edit.setDate(QDateTime.currentDateTime().addMonths(-1).date())
+    date_control_layout.addWidget(self.start_date_edit)
+
+    date_control_layout.addWidget(QLabel(self.tr("to")))
+    self.end_date_edit = QDateEdit()
+    self.end_date_edit.setCalendarPopup(True)
+    self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+    self.end_date_edit.setDate(QDateTime.currentDateTime().date())
+    date_control_layout.addWidget(self.end_date_edit)
+
+    self.refresh_btn = QPushButton(self.tr("Refresh History"))
+    self.refresh_btn.clicked.connect(self.refresh_player_history)
+    date_control_layout.addWidget(self.refresh_btn)
+
+    date_control_layout.addStretch()
+
+    # 历史图表
+    self.history_chart = HistoryChartWidget()
+    self.history_layout.addWidget(self.history_chart)
+    self.main_widget.addTab(self.history_tab, self.tr("Player History"))
+
+    # 玩家成长分析标签页
+    self.growth_tab = QWidget()
+    self.growth_layout = QVBoxLayout(self.growth_tab)
+
+    # 成长分析控件
+    growth_control_layout = QHBoxLayout()
+    self.growth_layout.addLayout(growth_control_layout)
+
+    growth_control_layout.addWidget(QLabel(self.tr("Sort By:")))
+    self.sort_combo = QComboBox()
+    self.sort_combo.addItem(self.tr("Rank Change (Best First)"), "rank_change")
+    self.sort_combo.addItem(self.tr("Level Change (Best First)"), "lv_change")
+    self.sort_combo.addItem(self.tr("Experience Change (Best First)"), "exp_change")
+    self.sort_combo.addItem(self.tr("Play Count Change (Best First)"), "pc_change")
+    self.sort_combo.addItem(self.tr("Daily EXP Growth (Best First)"), "daily_exp_growth")
+    self.sort_combo.addItem(self.tr("Player Name (A-Z)"), "name")
+    growth_control_layout.addWidget(self.sort_combo)
+
+    self.refresh_growth_btn = QPushButton(self.tr("Refresh Growth Data"))
+    self.refresh_growth_btn.clicked.connect(self.refresh_growth_data)
+    growth_control_layout.addWidget(self.refresh_growth_btn)
+
+    growth_control_layout.addStretch()
+
+    # 成长数据表格
+    self.growth_table = QTableWidget()
+    self.growth_table.setColumnCount(8)
+    self.growth_table.setHorizontalHeaderLabels([
+      self.tr("Player"),
+      self.tr("Rank Change"),
+      self.tr("Level Change"),
+      self.tr("EXP Change"),
+      self.tr("Play Count Change"),
+      self.tr("Daily EXP Growth"),
+      self.tr("Period"),
+      self.tr("Days")
+    ])
+    self.growth_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+    self.growth_table.setSortingEnabled(True)
+    self.growth_table.setSelectionBehavior(QTableWidget.SelectRows)
+    self.growth_table.setEditTriggers(QTableWidget.NoEditTriggers)
+    self.growth_layout.addWidget(self.growth_table)
+    self.main_widget.addTab(self.growth_tab, self.tr("Player Growth"))
+
+    # 连接模式选择信号
+    self.chart_widget.mode_combo.currentIndexChanged.connect(self.on_mode_selected)
 
   def on_mode_selected(self):
     """当用户选择模式时触发"""
@@ -193,6 +323,155 @@ class MainWindow(QMainWindow):
                          self.tr("Failed to analyze mode {}: {}").format(mode, error_msg))
     self.status_label.setText(self.tr("Ready"))
 
+  def create_menus(self):
+    """创建菜单栏"""
+    # 文件菜单
+    file_menu = self.menuBar().addMenu(self.tr("&File"))
+
+    self.open_action = QAction(QIcon(":/icons/open.png"), self.tr("&Open Folder"), self)
+    self.open_action.setShortcut("Ctrl+O")
+    self.open_action.triggered.connect(self.open_folder)
+    file_menu.addAction(self.open_action)
+
+    self.save_action = QAction(QIcon(":/icons/save.png"), self.tr("&Save Report"), self)
+    self.save_action.setShortcut("Ctrl+S")
+    self.save_action.triggered.connect(self.save_report)
+    file_menu.addAction(self.save_action)
+
+    file_menu.addSeparator()
+
+    self.exit_action = QAction(self.tr("E&xit"), self)
+    self.exit_action.setShortcut("Ctrl+Q")
+    self.exit_action.triggered.connect(self.close)
+    file_menu.addAction(self.exit_action)
+
+    # 语言菜单
+    lang_menu = self.menuBar().addMenu(self.tr("&Language"))
+
+    self.chinese_action = QAction(self.tr("中文"), self)
+    self.chinese_action.triggered.connect(lambda: self.set_language('zh_CN'))
+    self.chinese_action.setCheckable(True)
+    lang_menu.addAction(self.chinese_action)
+
+    self.english_action = QAction("English", self)
+    self.english_action.triggered.connect(lambda: self.set_language('en'))
+    self.english_action.setCheckable(True)
+    lang_menu.addAction(self.english_action)
+
+    # 创建互斥选项组
+    self.language_group = QActionGroup(self)
+    self.language_group.addAction(self.chinese_action)
+    self.language_group.addAction(self.english_action)
+    self.language_group.setExclusive(True)
+
+    # 帮助菜单
+    help_menu = self.menuBar().addMenu(self.tr("&Help"))
+
+    self.about_action = QAction(self.tr("&About"), self)
+    self.about_action.triggered.connect(self.show_about)
+    help_menu.addAction(self.about_action)
+
+  def load_language(self):
+    """加载语言设置"""
+    lang = self.settings.value("language", "")
+    if not lang:
+      lang = get_system_language()
+      logger.debug(f"No saved language, using system: {lang}")
+    else:
+      logger.debug(f"Loaded saved language: {lang}")
+
+    self.set_language(lang, initial_load=True)
+
+  def set_language(self, lang_code, initial_load=False):
+    """设置应用程序语言"""
+    # 如果语言没有变化，直接返回
+    current_lang = self.settings.value("language", "")
+    if current_lang == lang_code and not initial_load:
+      return
+
+    # 更新UI选择状态
+    if lang_code == 'zh_CN':
+      self.chinese_action.setChecked(True)
+      self.english_action.setChecked(False)
+    else:
+      self.chinese_action.setChecked(False)
+      self.english_action.setChecked(True)
+
+    # 保存语言设置
+    self.settings.setValue("language", lang_code)
+    self.settings.sync()  # 确保立即写入磁盘
+
+    logger.debug(f"Language set to: {lang_code}, saved to settings")
+
+    # 重新加载翻译器
+    QApplication.removeTranslator(self.translator)
+    self.translator = QTranslator()
+
+    if lang_code == 'zh_CN':
+      # 尝试多种方式加载中文翻译
+      loaded = False
+
+      # 方式1：从资源文件加载
+      if self.translator.load(":/translations/malody_zh_CN.qm"):
+        QApplication.installTranslator(self.translator)
+        loaded = True
+        logger.info("Loaded Chinese translation from resource")
+
+      # 方式2：从文件系统加载
+      if not loaded:
+        try:
+          script_dir = os.path.dirname(os.path.abspath(__file__))
+          qm_path = os.path.join(script_dir, "..", "translations", "malody_zh_CN.qm")
+          if os.path.exists(qm_path) and self.translator.load(qm_path):
+            QApplication.installTranslator(self.translator)
+            loaded = True
+            logger.info(f"Loaded Chinese translation from file: {qm_path}")
+          else:
+            logger.error(f"Failed to load translation file: {qm_path}")
+        except Exception as e:
+          logger.error(f"Error loading translation file: {str(e)}")
+
+      if not loaded:
+        logger.warning("Failed to load Chinese translation")
+
+    # 触发语言更改事件
+    self.retranslate_ui()
+
+    # 只有在语言实际变更时才发送事件
+    if current_lang != lang_code:
+      event = QEvent(QEvent.LanguageChange)
+      QApplication.sendEvent(self, event)
+
+    # 更新图表控件
+    self.chart_widget.retranslate_ui()
+
+    # 添加标签页标题翻译
+    self.main_widget.setTabText(0, self.tr("Mode Analysis"))
+    self.main_widget.setTabText(1, self.tr("Player History"))
+    self.main_widget.setTabText(2, self.tr("Player Growth"))
+
+    # 提示用户重启应用
+    if not initial_load:
+      QMessageBox.information(
+        self,
+        self.tr("Language Changed"),
+        self.tr("The application needs to restart for the language change to take full effect.")
+      )
+
+  def retranslate_ui(self):
+    """重新翻译所有UI文本"""
+    logger.debug("Retranslating UI elements")
+
+    # 更新所有UI文本
+    self.setWindowTitle(self.tr("Malody Analytics Tool"))
+    self.open_action.setText(self.tr("&Open Folder"))
+    self.save_action.setText(self.tr("&Save Report"))
+    self.exit_action.setText(self.tr("E&xit"))
+    self.chinese_action.setText(self.tr("中文"))
+    self.english_action.setText(self.tr("English"))
+    self.about_action.setText(self.tr("&About"))
+    self.status_label.setText(self.tr("Ready"))
+
     # 添加成长表格标题翻译
     self.growth_table.setHorizontalHeaderLabels([
       self.tr("Player"),
@@ -233,23 +512,44 @@ class MainWindow(QMainWindow):
 
     if folder_path:
       self.folder_path = folder_path
-      self.status_label.setText(self.tr("Folder selected"))
+      self.status_label.setText(self.tr("Processing folder..."))
+      self.progress_bar.setVisible(True)
+      self.progress_bar.setValue(0)
+      self.open_action.setEnabled(False)
 
-      # 清除之前的分析数据
-      self.chart_widget.mode_data.clear()
-      self.chart_widget.show_empty_chart()
+      # 启动玩家列表加载线程
+      self.player_list_thread = PlayerListThread(folder_path)
+      self.player_list_thread.finished.connect(self.on_player_list_loaded)
+      self.player_list_thread.error.connect(self.on_player_list_error)
+      self.player_list_thread.start()
 
-      # 加载玩家列表
-      self.load_player_list()
-
-      # 加载成长数据
-      self.refresh_growth_data()
-
-  def on_analysis_error(self, error_msg):
-    """分析出错的处理"""
+  def on_player_list_loaded(self, player_set):
+    """玩家列表加载完成"""
     self.open_action.setEnabled(True)
     self.progress_bar.setVisible(False)
-    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to process folder: {}").format(error_msg))
+
+    # 更新玩家下拉框
+    self.player_combo.clear()
+    sorted_players = sorted(player_set)
+    self.player_combo.addItems(sorted_players)
+    self.history_chart.set_player_list(sorted_players)
+
+    if sorted_players:
+      self.player_combo.setCurrentIndex(0)
+
+    # 清除之前的分析数据
+    self.chart_widget.mode_data.clear()
+    self.chart_widget.show_empty_chart()
+
+    # 加载成长数据
+    self.refresh_growth_data()
+
+    self.status_label.setText(self.tr("Folder loaded successfully"))
+
+  def on_player_list_error(self, error_msg):
+    self.open_action.setEnabled(True)
+    self.progress_bar.setVisible(False)
+    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load player list: {}").format(error_msg))
     self.status_label.setText(self.tr("Ready"))
 
   def save_report(self):
@@ -272,38 +572,6 @@ class MainWindow(QMainWindow):
       logger.debug("LanguageChange event received")
       self.retranslate_ui()
     super().changeEvent(event)
-
-  def load_player_list(self):
-    """加载玩家列表"""
-    if not self.folder_path:
-      return
-
-    # 获取所有玩家
-    all_players = set()
-    for mode in MODE_FILES.keys():
-      file_path = os.path.join(self.folder_path, MODE_FILES[mode])
-      if not os.path.exists(file_path):
-        continue
-
-      try:
-        wb = load_workbook(file_path)
-        for sheet_name in wb.sheetnames:
-          if not sheet_name.startswith(f"mode_{mode}_"):
-            continue
-
-          df = pd.read_excel(file_path, sheet_name=sheet_name)
-          all_players.update(df['name'].unique())
-      except Exception as e:
-        logger.error(f"Error loading players from {file_path}: {str(e)}")
-        continue
-
-    # 更新玩家下拉框
-    self.player_combo.clear()
-    self.player_combo.addItems(sorted(all_players))
-    self.history_chart.set_player_list(sorted(all_players))
-
-    if all_players:
-      self.player_combo.setCurrentIndex(0)
 
   def on_player_changed(self, index):
     """玩家选择改变时触发"""
