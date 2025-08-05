@@ -3,8 +3,10 @@ import locale
 import sys
 import os
 import logging
-from PyQt5.QtCore import QTranslator, QLocale, QSettings  # 添加 QSettings 导入
+from PyQt5.QtCore import QTranslator, QLocale, QSettings
 from PyQt5.QtWidgets import QApplication
+import psutil
+
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +14,7 @@ logger = logging.getLogger(__name__)
 def install_translator(app):
   """安装翻译器到应用程序"""
   # 获取用户设置
-  settings = QSettings("MalodyAnalytics", "MalodyAnalyticsTool")  # 现在 QSettings 已定义
+  settings = QSettings("MalodyAnalytics", "MalodyAnalyticsTool")
 
   logger.debug(f"User language setting: {settings.value('language', '')}")
 

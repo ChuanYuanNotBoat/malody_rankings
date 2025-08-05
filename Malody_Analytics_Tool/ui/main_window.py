@@ -9,41 +9,91 @@ from PyQt5.QtWidgets import (
   QTabWidget, QDateEdit, QHBoxLayout, QPushButton, QTableWidget,
   QTableWidgetItem, QHeaderView, QComboBox, QProgressBar
 )
-from PyQt5.QtCore import QSettings, QEvent, QTranslator, Qt, QDateTime, QThread, pyqtSignal
+from PyQt5.QtCore import QSettings, QEvent, QTranslator, Qt, QDateTime, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon
 from core.analytics import analyze_mode_data, MODE_FILES, get_latest_sheet_data
 from core.history_analyzer import get_player_history, get_all_players_growth
 from widgets.chart_widget import ChartWidget
 from widgets.history_chart import HistoryChartWidget
+import concurrent.futures
+import psutil
+from core.history_analyzer import calculate_player_growth
+
 
 logger = logging.getLogger(__name__)
 
+# 设置最大内存使用
+MAX_MEMORY = psutil.virtual_memory().available * 0.7  # 使用70%可用内存
+
 
 # ================= 后台线程类 =================
-class ModeAnalysisThread(QThread):
-  finished = pyqtSignal(int, dict)  # 模式, 分析结果
+class ParallelAnalysisThread(QThread):
+  finished = pyqtSignal(dict)  # 所有模式的分析结果
+  progress = pyqtSignal(int, int)  # 当前进度, 总任务数
   error = pyqtSignal(int, str)  # 模式, 错误信息
 
-  def __init__(self, mode, file_path):
+  def __init__(self, folder_path):
     super().__init__()
-    self.mode = mode
-    self.file_path = file_path
+    self.folder_path = folder_path
+    self.results = {}
+    self.cancel_requested = False
 
   def run(self):
     try:
-      if not os.path.exists(self.file_path):
-        self.error.emit(self.mode, f"File not found: {self.file_path}")
-        return
+      mode_files = list(MODE_FILES.items())
+      total = len(mode_files)
 
-      df = get_latest_sheet_data(self.file_path)
-      if df.empty:
-        self.error.emit(self.mode, f"No valid data found in {self.file_path}")
-        return
+      # 使用线程池并行处理
+      with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(4, os.cpu_count())
+      ) as executor:
+        futures = {}
+        for mode, filename in mode_files:
+          if self.cancel_requested:
+            break
 
-      mode_results = analyze_mode_data(df, self.mode)
-      self.finished.emit(self.mode, mode_results)
+          file_path = os.path.join(self.folder_path, filename)
+          futures[executor.submit(self.analyze_mode, mode, file_path)] = mode
+
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+          if self.cancel_requested:
+            break
+
+          mode = futures[future]
+          try:
+            result = future.result()
+            if result:
+              self.results[mode] = result
+          except Exception as e:
+            self.error.emit(mode, str(e))
+
+          completed += 1
+          self.progress.emit(completed, total)
+
+      if not self.cancel_requested:
+        self.finished.emit(self.results)
+
     except Exception as e:
-      self.error.emit(self.mode, str(e))
+      logger.error(f"Parallel analysis failed: {str(e)}")
+
+  def analyze_mode(self, mode, file_path):
+    """分析单个模式"""
+    if not os.path.exists(file_path):
+      return None
+
+    try:
+      df = get_latest_sheet_data(file_path)
+      if df.empty:
+        return None
+      return analyze_mode_data(df, mode)
+    except Exception as e:
+      logger.error(f"Error analyzing mode {mode}: {str(e)}")
+      raise e
+
+  def cancel(self):
+    """取消分析任务"""
+    self.cancel_requested = True
 
 
 class HistoryThread(QThread):
@@ -81,52 +131,81 @@ class HistoryThread(QThread):
 class GrowthThread(QThread):
   finished = pyqtSignal(dict)  # 成长数据
   error = pyqtSignal(str)
+  progress = pyqtSignal(int, int)  # 当前进度, 总任务数
 
   def __init__(self, folder_path, start_date, end_date):
     super().__init__()
     self.folder_path = folder_path
     self.start_date = start_date
     self.end_date = end_date
+    self.cancel_requested = False
 
   def run(self):
     try:
-      growth_data = get_all_players_growth(self.folder_path, self.start_date, self.end_date)
-      self.finished.emit(growth_data)
-    except Exception as e:
-      self.error.emit(str(e))
-
-
-class PlayerListThread(QThread):
-  finished = pyqtSignal(set)  # 玩家列表
-  error = pyqtSignal(str)
-
-  def __init__(self, folder_path):
-    super().__init__()
-    self.folder_path = folder_path
-
-  def run(self):
-    try:
+      # 首先获取所有玩家列表
       all_players = set()
-      for mode in MODE_FILES.keys():
-        file_path = os.path.join(self.folder_path, MODE_FILES[mode])
+      for mode, filename in MODE_FILES.items():
+        file_path = os.path.join(self.folder_path, filename)
         if not os.path.exists(file_path):
           continue
 
         try:
-          wb = load_workbook(file_path)
+          # 使用只读模式
+          wb = load_workbook(file_path, read_only=True)
           for sheet_name in wb.sheetnames:
             if not sheet_name.startswith(f"mode_{mode}_"):
               continue
 
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
-            all_players.update(df['name'].unique())
+            ws = wb[sheet_name]
+            headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+            # 找到玩家名称所在的列
+            try:
+              name_col_idx = headers.index("name")
+            except ValueError:
+              continue
+
+            # 收集玩家名称
+            for row in ws.iter_rows(min_row=2):
+              if name_col_idx < len(row) and row[name_col_idx].value:
+                all_players.add(row[name_col_idx].value)
+
+          wb.close()
         except Exception as e:
           logger.error(f"Error loading players from {file_path}: {str(e)}")
           continue
 
-      self.finished.emit(all_players)
+      player_list = list(all_players)
+      total_players = len(player_list)
+      player_growth = {}
+
+      # 处理每个玩家
+      for idx, player in enumerate(player_list):
+        if self.cancel_requested:
+          break
+
+        try:
+          # 确保正确传递文件夹路径
+          history = get_player_history(self.folder_path, player)
+
+          # 计算成长数据 - 使用正确的函数
+          growth = calculate_player_growth(history, self.start_date, self.end_date)
+          if growth:
+            player_growth[player] = growth
+        except Exception as e:
+          logger.error(f"Error calculating growth for {player}: {str(e)}")
+        # 每处理10个玩家更新一次进度
+        if idx % 10 == 0:
+          self.progress.emit(idx + 1, total_players)
+
+      if not self.cancel_requested:
+        self.finished.emit(player_growth)
     except Exception as e:
       self.error.emit(str(e))
+
+  def cancel(self):
+    """取消任务"""
+    self.cancel_requested = True
 
 
 # ================= 主窗口类 =================
@@ -138,9 +217,20 @@ class MainWindow(QMainWindow):
     self.folder_path = ""
     self.player_history = []
     self.player_growth_data = {}
-    self.analysis_threads = {}  # 存储分析线程
     self.init_ui()
     self.load_language()
+
+    # 内存监控
+    self.memory_timer = QTimer(self)
+    self.memory_timer.timeout.connect(self.monitor_memory)
+    self.memory_timer.start(5000)  # 每5秒检查一次内存
+
+  def monitor_memory(self):
+    """监控内存使用情况"""
+    mem = psutil.virtual_memory()
+    if mem.percent > 90:
+      logger.warning(f"内存使用过高: {mem.percent}%")
+      self.status_label.setText(self.tr("警告: 内存使用过高! 请关闭其他应用"))
 
   def init_ui(self):
     # 设置窗口标题和图标
@@ -162,6 +252,12 @@ class MainWindow(QMainWindow):
     self.progress_bar.setMaximum(100)
     self.progress_bar.setVisible(False)
     self.status_bar.addPermanentWidget(self.progress_bar)
+
+    # 在状态栏添加取消按钮
+    self.cancel_button = QPushButton(self.tr("取消操作"))
+    self.cancel_button.clicked.connect(self.cancel_operations)
+    self.cancel_button.setVisible(False)
+    self.status_bar.addPermanentWidget(self.cancel_button)
 
     # 创建主内容区域
     self.main_widget = QTabWidget()
@@ -514,43 +610,95 @@ class MainWindow(QMainWindow):
       self.folder_path = folder_path
       self.status_label.setText(self.tr("Processing folder..."))
       self.progress_bar.setVisible(True)
-      self.progress_bar.setValue(0)
+      self.progress_bar.setRange(0, len(MODE_FILES))
       self.open_action.setEnabled(False)
+      self.cancel_button.setVisible(True)
 
-      # 启动玩家列表加载线程
-      self.player_list_thread = PlayerListThread(folder_path)
-      self.player_list_thread.finished.connect(self.on_player_list_loaded)
-      self.player_list_thread.error.connect(self.on_player_list_error)
-      self.player_list_thread.start()
+      # 启动并行分析线程
+      self.analysis_thread = ParallelAnalysisThread(folder_path)
+      self.analysis_thread.finished.connect(self.on_analysis_completed)
+      self.analysis_thread.progress.connect(self.update_analysis_progress)
+      self.analysis_thread.error.connect(self.on_analysis_error)
+      self.analysis_thread.start()
 
-  def on_player_list_loaded(self, player_set):
-    """玩家列表加载完成"""
-    self.open_action.setEnabled(True)
+  def update_analysis_progress(self, completed, total):
+    """更新分析进度"""
+    self.progress_bar.setValue(completed)
+    self.status_label.setText(
+      self.tr("Processing: {}/{} modes").format(completed, total)
+    )
+
+  def on_analysis_completed(self, results):
+    """分析完成处理"""
     self.progress_bar.setVisible(False)
+    self.open_action.setEnabled(True)
+    self.cancel_button.setVisible(False)
 
-    # 更新玩家下拉框
-    self.player_combo.clear()
-    sorted_players = sorted(player_set)
-    self.player_combo.addItems(sorted_players)
-    self.history_chart.set_player_list(sorted_players)
+    self.chart_widget.mode_data = results
+    self.chart_widget.on_mode_changed()
 
-    if sorted_players:
-      self.player_combo.setCurrentIndex(0)
-
-    # 清除之前的分析数据
-    self.chart_widget.mode_data.clear()
-    self.chart_widget.show_empty_chart()
+    # 加载玩家列表
+    self.load_player_list()
 
     # 加载成长数据
     self.refresh_growth_data()
 
     self.status_label.setText(self.tr("Folder loaded successfully"))
 
-  def on_player_list_error(self, error_msg):
-    self.open_action.setEnabled(True)
-    self.progress_bar.setVisible(False)
-    QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load player list: {}").format(error_msg))
+  def on_analysis_error(self, mode, error_msg):
+    """分析出错"""
+    QMessageBox.critical(self, self.tr("Error"),
+                         self.tr("Failed to analyze mode {}: {}").format(mode, error_msg))
     self.status_label.setText(self.tr("Ready"))
+
+  def load_player_list(self):
+    """加载玩家列表"""
+    if not self.folder_path:
+      return
+
+    try:
+      all_players = set()
+      for mode, filename in MODE_FILES.items():
+        file_path = os.path.join(self.folder_path, filename)
+        if not os.path.exists(file_path):
+          continue
+
+        try:
+          # 使用只读模式
+          wb = load_workbook(file_path, read_only=True)
+          for sheet_name in wb.sheetnames:
+            if not sheet_name.startswith(f"mode_{mode}_"):
+              continue
+
+            ws = wb[sheet_name]
+            headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+            # 找到玩家名称所在的列
+            try:
+              name_col_idx = headers.index("name")
+            except ValueError:
+              continue
+
+            # 收集玩家名称
+            for row in ws.iter_rows(min_row=2):
+              if name_col_idx < len(row) and row[name_col_idx].value:
+                all_players.add(row[name_col_idx].value)
+
+          wb.close()
+        except Exception as e:
+          logger.error(f"Error loading players from {file_path}: {str(e)}")
+          continue
+
+      # 更新玩家下拉框
+      self.player_combo.clear()
+      if all_players:
+        sorted_players = sorted(all_players)
+        self.player_combo.addItems(sorted_players)
+        self.history_chart.set_player_list(sorted_players)
+        self.player_combo.setCurrentIndex(0)
+
+    except Exception as e:
+      logger.error(f"Error loading player list: {str(e)}")
 
   def save_report(self):
     """保存分析报告"""
@@ -590,6 +738,7 @@ class MainWindow(QMainWindow):
 
     self.status_label.setText(self.tr("Loading history for {}...").format(player_name))
     self.refresh_btn.setEnabled(False)
+    self.cancel_button.setVisible(True)
 
     # 创建并启动历史数据线程
     self.history_thread = HistoryThread(
@@ -605,11 +754,13 @@ class MainWindow(QMainWindow):
 
   def on_history_finished(self, player_name, history):
     self.refresh_btn.setEnabled(True)
+    self.cancel_button.setVisible(False)
     self.history_chart.set_history_data(player_name, history)
     self.status_label.setText(self.tr("History loaded for {}").format(player_name))
 
   def on_history_error(self, error_msg):
     self.refresh_btn.setEnabled(True)
+    self.cancel_button.setVisible(False)
     QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to load history: {}").format(error_msg))
     self.status_label.setText(self.tr("Ready"))
 
@@ -623,23 +774,64 @@ class MainWindow(QMainWindow):
 
     self.status_label.setText(self.tr("Calculating player growth..."))
     self.refresh_growth_btn.setEnabled(False)
+    self.progress_bar.setVisible(True)
+    self.progress_bar.setRange(0, 100)  # 不确定进度
+    self.cancel_button.setVisible(True)
 
     # 创建并启动成长数据线程
     self.growth_thread = GrowthThread(self.folder_path, start_date, end_date)
     self.growth_thread.finished.connect(self.on_growth_finished)
     self.growth_thread.error.connect(self.on_growth_error)
+    self.growth_thread.progress.connect(self.update_growth_progress)
     self.growth_thread.start()
+
+  def update_growth_progress(self, current, total):
+    """更新成长数据进度"""
+    self.progress_bar.setValue(int(current / total * 100))
+    self.status_label.setText(
+      self.tr("Processing players: {}/{}").format(current, total)
+    )
 
   def on_growth_finished(self, growth_data):
     self.refresh_growth_btn.setEnabled(True)
+    self.progress_bar.setVisible(False)
+    self.cancel_button.setVisible(False)
     self.player_growth_data = growth_data
     self.update_growth_table()
     self.status_label.setText(self.tr("Growth data updated"))
 
   def on_growth_error(self, error_msg):
     self.refresh_growth_btn.setEnabled(True)
+    self.progress_bar.setVisible(False)
+    self.cancel_button.setVisible(False)
     QMessageBox.critical(self, self.tr("Error"), self.tr("Failed to calculate growth: {}").format(error_msg))
     self.status_label.setText(self.tr("Ready"))
+
+  def cancel_operations(self):
+    """取消所有后台操作"""
+    if hasattr(self, 'analysis_thread') and self.analysis_thread.isRunning():
+      self.analysis_thread.cancel()
+      self.analysis_thread.quit()
+      self.analysis_thread.wait()
+      self.status_label.setText(self.tr("Operation cancelled"))
+      self.progress_bar.setVisible(False)
+      self.open_action.setEnabled(True)
+
+    if hasattr(self, 'history_thread') and self.history_thread.isRunning():
+      self.history_thread.terminate()
+      self.history_thread.wait()
+      self.status_label.setText(self.tr("Operation cancelled"))
+      self.refresh_btn.setEnabled(True)
+
+    if hasattr(self, 'growth_thread') and self.growth_thread.isRunning():
+      self.growth_thread.cancel()
+      self.growth_thread.quit()
+      self.growth_thread.wait()
+      self.status_label.setText(self.tr("Operation cancelled"))
+      self.progress_bar.setVisible(False)
+      self.refresh_growth_btn.setEnabled(True)
+
+    self.cancel_button.setVisible(False)
 
   def update_growth_table(self):
     """更新成长数据表格"""

@@ -1,8 +1,11 @@
 import os
+import re
 import pandas as pd
 from datetime import datetime
 from openpyxl import load_workbook
 import logging
+import numpy as np
+import pyarrow as pa
 
 # 添加logger定义
 logger = logging.getLogger(__name__)
@@ -19,42 +22,45 @@ for i in range(1, 10):
 
 
 def get_latest_sheet_data(file_path):
-  """读取一个模式文件中最新时间的工作表，返回DataFrame"""
-  if not os.path.exists(file_path):
+  """获取指定Excel文件中最新工作表的数据"""
+  try:
+    # 获取所有工作表名
+    wb = load_workbook(file_path, read_only=True)
+    sheet_names = wb.sheetnames
+
+    # 过滤并排序工作表（按日期降序）
+    valid_sheets = []
+    for name in sheet_names:
+      match = re.match(r"mode_(\d+)_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2})", name)
+      if match:
+        mode, date_str, time_str = match.groups()
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        time_obj = datetime.strptime(time_str, "%H-%M")
+        # 组合日期和时间
+        combined = datetime.combine(date_obj.date(), time_obj.time())
+        valid_sheets.append((name, combined))
+
+    if not valid_sheets:
+      logger.warning(f"No valid sheets found in {file_path}")
+      return pd.DataFrame()
+
+    # 按日期降序排序
+    valid_sheets.sort(key=lambda x: x[1], reverse=True)
+    latest_sheet = valid_sheets[0][0]
+    logger.debug(f"Found {len(valid_sheets)} valid sheets, using latest: {latest_sheet}")
+
+    # 读取数据 - 移除 chunksize 参数
+    df = pd.read_excel(file_path, sheet_name=latest_sheet)
+
+    # 确保有数据
+    if df.empty:
+      logger.warning(f"Latest sheet '{latest_sheet}' in {file_path} is empty")
+
+    return df
+
+  except Exception as e:
+    logger.error(f"Error reading {file_path}: {str(e)}")
     return pd.DataFrame()
-
-  # 获取所有工作表名
-  wb = load_workbook(file_path)
-  sheet_names = wb.sheetnames
-
-  # 筛选出以'mode_{mode}_'开头的sheet
-  sheets_with_time = []
-  for sheet in sheet_names:
-    if not sheet.startswith("mode_"):
-      continue
-
-    try:
-      # 提取时间部分
-      parts = sheet.split('_')
-      if len(parts) < 3:
-        continue
-
-      # 最后两部分是日期和时间
-      time_str = f"{parts[-2]}_{parts[-1]}"
-      dt = datetime.strptime(time_str, "%Y-%m-%d_%H-%M")
-      sheets_with_time.append((dt, sheet))
-    except Exception as e:
-      logger.warning(f"Failed to parse sheet name '{sheet}': {str(e)}")
-      continue
-
-  if not sheets_with_time:
-    logger.debug(f"No valid sheets found in {file_path}")
-    return pd.DataFrame()
-
-  # 按时间排序，获取最新的
-  latest_sheet = max(sheets_with_time, key=lambda x: x[0])[1]
-  logger.debug(f"Found {len(sheets_with_time)} valid sheets, using latest: {latest_sheet}")
-  return pd.read_excel(file_path, sheet_name=latest_sheet)
 
 
 def analyze_mode_data(df, mode):
