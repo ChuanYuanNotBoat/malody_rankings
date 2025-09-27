@@ -1,0 +1,4 @@
+crawler.log
+malody_rankings.db-shm
+malody_rankings.db-wal
+viz_output/*
