@@ -79,10 +79,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def get_git_commit_message():
-    """动态生成Git提交消息"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M updated")
-
 class DatabaseManager:
     _instance = None
     _lock = Lock()
