@@ -11,10 +11,13 @@ import sys
 import sqlite3
 import subprocess
 import json
-from threading import Lock
+from threading import Lock, Thread
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import re
+import argparse
 
 # 修复Python 3.12中SQLite datetime适配器的弃用警告
 def adapt_datetime(dt):
@@ -58,14 +61,25 @@ HEADERS = {
 }
 
 BASE_URL = "https://m.mugzone.net/page/all/player?from=0&mode={mode}"
+PLAYER_PROFILE_URL = "https://m.mugzone.net/accounts/user/{player_id}"
 MODES = list(range(10))
 
 DB_FILE = "malody_rankings.db"
 
 GIT_REPO_PATH = os.path.dirname(os.path.abspath(__file__))
+GIT_COMMIT_MESSAGE = datetime.now().strftime("%Y-%m-%d %H:%M updated")
 
 stop_requested = False
 stop_lock = Lock()
+
+# 玩家配置文件
+PLAYER_CONFIG_FILE = "players.txt"
+
+# 玩家爬取队列和状态
+player_queue = queue.Queue()
+player_crawl_lock = Lock()
+player_crawl_in_progress = False
+last_player_crawl_time = None
 
 def signal_handler(sig, frame):
     global stop_requested
@@ -145,100 +159,274 @@ class DatabaseManager:
             conn.rollback()
             raise e
 
+def migrate_database():
+    """迁移数据库，添加uid字段"""
+    db_manager = DatabaseManager()
+    cursor = db_manager.get_connection().cursor()
+    
+    logger.info("开始数据库迁移...")
+    
+    try:
+        # 检查是否已经迁移过
+        cursor.execute("PRAGMA table_info(player_identity)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'uid' not in columns:
+            # 添加uid字段到player_identity表
+            cursor.execute('ALTER TABLE player_identity ADD COLUMN uid TEXT')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
+            logger.info("已添加uid字段到player_identity表")
+        
+        # 检查player_aliases表
+        cursor.execute("PRAGMA table_info(player_aliases)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'uid' not in columns:
+            # 添加uid字段到player_aliases表
+            cursor.execute('ALTER TABLE player_aliases ADD COLUMN uid TEXT')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
+            logger.info("已添加uid字段到player_aliases表")
+        
+        # 检查player_rankings表
+        cursor.execute("PRAGMA table_info(player_rankings)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'uid' not in columns:
+            # 添加uid字段到player_rankings表
+            cursor.execute('ALTER TABLE player_rankings ADD COLUMN uid TEXT')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
+            logger.info("已添加uid字段到player_rankings表")
+        
+        db_manager.get_connection().commit()
+        
+        # 记录SQL变更
+        with open('sql_changes.md', 'w', encoding='utf-8') as f:
+            f.write("# SQL数据库结构变更记录\n\n")
+            f.write("## 版本 2.0 - 添加UID支持\n\n")
+            f.write("### 变更内容\n\n")
+            f.write("1. 在 `player_identity` 表中添加 `uid` 字段\n")
+            f.write("2. 在 `player_aliases` 表中添加 `uid` 字段\n")
+            f.write("3. 在 `player_rankings` 表中添加 `uid` 字段\n")
+            f.write("4. 为各表的 `uid` 字段创建索引\n\n")
+            f.write("### SQL语句\n\n")
+            f.write("```sql\n")
+            f.write("-- 添加uid字段\n")
+            f.write("ALTER TABLE player_identity ADD COLUMN uid TEXT;\n")
+            f.write("ALTER TABLE player_aliases ADD COLUMN uid TEXT;\n")
+            f.write("ALTER TABLE player_rankings ADD COLUMN uid TEXT;\n\n")
+            f.write("-- 创建索引\n")
+            f.write("CREATE INDEX idx_player_identity_uid ON player_identity(uid);\n")
+            f.write("CREATE INDEX idx_player_aliases_uid ON player_aliases(uid);\n")
+            f.write("CREATE INDEX idx_player_rankings_uid ON player_rankings(uid);\n")
+            f.write("```\n")
+        
+        logger.info("数据库迁移完成，变更已记录到 sql_changes.md")
+        return True
+    except Exception as e:
+        logger.error("数据库迁移失败: %s", e)
+        db_manager.get_connection().rollback()
+        return False
+
 def init_database():
     """初始化数据库，创建表结构"""
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS player_identity (
-        player_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        current_name TEXT NOT NULL,
-        first_seen TIMESTAMP NOT NULL,
-        last_seen TIMESTAMP NOT NULL
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS player_aliases (
-        alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_id INTEGER NOT NULL,
-        alias TEXT NOT NULL,
-        first_seen TIMESTAMP NOT NULL,
-        last_seen TIMESTAMP NOT NULL,
-        FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS player_rankings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_id INTEGER,
-        mode INTEGER NOT NULL,
-        rank INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        lv INTEGER,
-        exp INTEGER,
-        acc REAL,
-        combo INTEGER,
-        pc INTEGER,
-        crawl_time TIMESTAMP NOT NULL,
-        FOREIGN KEY (player_id) REFERENCES player_identity (player_id),
-        UNIQUE(mode, rank, crawl_time)
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS import_metadata (
-        mode INTEGER PRIMARY KEY,
-        last_import_time TIMESTAMP
-    )
-    ''')
-    
-    for mode in MODES:
-        cursor.execute(
-            "INSERT OR IGNORE INTO import_metadata (mode, last_import_time) VALUES (?, NULL)",
-            (mode,)
+    try:
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_identity (
+            player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT,
+            current_name TEXT NOT NULL,
+            first_seen TIMESTAMP NOT NULL,
+            last_seen TIMESTAMP NOT NULL
         )
-    
-    db_manager.get_connection().commit()
-    logger.info("数据库初始化完成")
+        ''')
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_aliases (
+            alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            uid TEXT,
+            alias TEXT NOT NULL,
+            first_seen TIMESTAMP NOT NULL,
+            last_seen TIMESTAMP NOT NULL,
+            FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
+        )
+        ''')
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_rankings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            uid TEXT,
+            mode INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            lv INTEGER,
+            exp INTEGER,
+            acc REAL,
+            combo INTEGER,
+            pc INTEGER,
+            crawl_time TIMESTAMP NOT NULL,
+            FOREIGN KEY (player_id) REFERENCES player_identity (player_id),
+            UNIQUE(mode, rank, crawl_time)
+        )
+        ''')
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS import_metadata (
+            mode INTEGER PRIMARY KEY,
+            last_import_time TIMESTAMP
+        )
+        ''')
+        
+        # 新增玩家配置表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_config (
+            config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_identifier TEXT NOT NULL UNIQUE,
+            player_name TEXT,
+            is_active BOOLEAN DEFAULT 1,
+            priority INTEGER DEFAULT 5,
+            notes TEXT,
+            created_time TIMESTAMP NOT NULL,
+            last_updated TIMESTAMP NOT NULL
+        )
+        ''')
+        
+        # 新增玩家爬取状态表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS player_crawl_status (
+            player_identifier TEXT PRIMARY KEY,
+            last_crawled TIMESTAMP,
+            crawl_count INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            last_error TEXT
+        )
+        ''')
+        
+        # 创建索引
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
+        
+        for mode in MODES:
+            cursor.execute(
+                "INSERT OR IGNORE INTO import_metadata (mode, last_import_time) VALUES (?, NULL)",
+                (mode,)
+            )
+        
+        db_manager.get_connection().commit()
+        logger.info("数据库初始化完成")
+        
+        # 初始化后执行迁移
+        migrate_database()
+        
+    except Exception as e:
+        logger.error("数据库初始化失败: %s", e)
+        raise
 
-def resolve_player_identity(name, crawl_time):
-    """解析玩家身份，处理改名情况"""
+def resolve_player_identity(name, crawl_time, uid=None):
+    """解析玩家身份，优先使用uid，处理改名情况"""
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     
     try:
-        cursor.execute(
-            "SELECT player_id FROM player_aliases WHERE alias = ?",
-            (name,)
-        )
-        result = cursor.fetchone()
+        player_id = None
         
-        if result:
-            player_id = result[0]
+        # 优先使用uid查找
+        if uid:
+            try:
+                cursor.execute(
+                    "SELECT player_id FROM player_identity WHERE uid = ?",
+                    (uid,)
+                )
+                result = cursor.fetchone()
+                
+                if result:
+                    player_id = result[0]
+                    
+                    # 更新最后出现时间
+                    cursor.execute(
+                        "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
+                        (crawl_time, name, player_id)
+                    )
+                    
+                    # 检查别名是否存在
+                    cursor.execute(
+                        "SELECT alias_id FROM player_aliases WHERE player_id = ? AND alias = ?",
+                        (player_id, name)
+                    )
+                    if not cursor.fetchone():
+                        # 添加新别名
+                        cursor.execute(
+                            "INSERT INTO player_aliases (player_id, uid, alias, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
+                            (player_id, uid, name, crawl_time, crawl_time)
+                        )
+                    else:
+                        # 更新现有别名
+                        cursor.execute(
+                            "UPDATE player_aliases SET last_seen = ? WHERE player_id = ? AND alias = ?",
+                            (crawl_time, player_id, name)
+                        )
+            except sqlite3.OperationalError as e:
+                if "no such column: uid" in str(e):
+                    logger.warning("uid列不存在，回退到名称查找")
+                    # 回退到名称查找
+                    pass
+                else:
+                    raise
+        
+        # 如果没有uid或通过uid没找到，使用名称查找
+        if not player_id:
+            cursor.execute(
+                "SELECT player_id FROM player_aliases WHERE alias = ?",
+                (name,)
+            )
+            result = cursor.fetchone()
             
-            cursor.execute(
-                "UPDATE player_aliases SET last_seen = ? WHERE alias = ?",
-                (crawl_time, name)
-            )
-            
-            cursor.execute(
-                "UPDATE player_identity SET last_seen = ? WHERE player_id = ?",
-                (crawl_time, player_id)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO player_identity (current_name, first_seen, last_seen) VALUES (?, ?, ?)",
-                (name, crawl_time, crawl_time)
-            )
-            player_id = cursor.lastrowid
-            
-            cursor.execute(
-                "INSERT INTO player_aliases (player_id, alias, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-                (player_id, name, crawl_time, crawl_time)
-            )
+            if result:
+                player_id = result[0]
+                
+                # 如果提供了uid，更新uid信息
+                if uid:
+                    try:
+                        cursor.execute(
+                            "UPDATE player_identity SET uid = ? WHERE player_id = ?",
+                            (uid, player_id)
+                        )
+                        cursor.execute(
+                            "UPDATE player_aliases SET uid = ? WHERE player_id = ?",
+                            (uid, player_id)
+                        )
+                    except sqlite3.OperationalError as e:
+                        if "no such column: uid" in str(e):
+                            logger.warning("uid列不存在，跳过uid更新")
+                        else:
+                            raise
+                
+                # 更新最后出现时间
+                cursor.execute(
+                    "UPDATE player_aliases SET last_seen = ? WHERE alias = ?",
+                    (crawl_time, name)
+                )
+                cursor.execute(
+                    "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
+                    (crawl_time, name, player_id)
+                )
+            else:
+                # 创建新玩家
+                cursor.execute(
+                    "INSERT INTO player_identity (uid, current_name, first_seen, last_seen) VALUES (?, ?, ?, ?)",
+                    (uid, name, crawl_time, crawl_time)
+                )
+                player_id = cursor.lastrowid
+                
+                cursor.execute(
+                    "INSERT INTO player_aliases (player_id, uid, alias, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
+                    (player_id, uid, name, crawl_time, crawl_time)
+                )
         
         db_manager.get_connection().commit()
         return player_id
@@ -308,6 +496,7 @@ def link_player_aliases(original_name, new_name, change_time):
         return False
 
 def parse_player_list(html):
+    """解析排行榜页面，返回玩家数据，包括玩家ID"""
     soup = BeautifulSoup(html, "html.parser")
     players = []
     
@@ -326,6 +515,15 @@ def parse_player_list(html):
         acc_tag = item.select_one("span.acc")
         combo_tag = item.select_one("span.combo")
         pc_tag = item.select_one("span.pc, span[class*=pc]")
+        
+        # 从链接中提取玩家ID
+        player_id = None
+        if name_tag and name_tag.has_attr('href'):
+            href = name_tag['href']
+            # 从类似 /accounts/user/123456 的链接中提取ID
+            match = re.search(r'/accounts/user/(\d+)', href)
+            if match:
+                player_id = match.group(1)
         
         level = None
         exp = None
@@ -356,6 +554,7 @@ def parse_player_list(html):
         players.append({
             "rank": rank,
             "name": name_tag.text.strip() if name_tag else None,
+            "player_id": player_id,
             "lv": level,
             "exp": exp,
             "acc": acc_text,
@@ -375,6 +574,14 @@ def parse_player_list(html):
         pc_tag = item.select_one("span.pc, span[class*=pc]")
         combo_tag = item.select_one("span.combo")
         
+        # 从链接中提取玩家ID
+        player_id = None
+        if name_tag and name_tag.has_attr('href'):
+            href = name_tag['href']
+            match = re.search(r'/accounts/user/(\d+)', href)
+            if match:
+                player_id = match.group(1)
+        
         acc_text = None
         if acc_tag:
             acc_text = acc_tag.text.replace("%", "").strip()
@@ -389,6 +596,7 @@ def parse_player_list(html):
         players.append({
             "rank": rank,
             "name": name_tag.text.strip() if name_tag else None,
+            "player_id": player_id,
             "lv": lv_tag.text.strip() if lv_tag else None,
             "exp": exp_tag.text.strip() if exp_tag else None,
             "acc": acc_text,
@@ -429,6 +637,7 @@ def parse_player_list(html):
             processed_players.append({
                 "rank": rank,
                 "name": p["name"],
+                "player_id": p["player_id"],
                 "lv": lv,
                 "exp": exp,
                 "acc": acc,
@@ -437,6 +646,134 @@ def parse_player_list(html):
             })
     
     return processed_players
+
+def parse_player_profile(html, player_id):
+    """解析玩家个人主页数据"""
+    soup = BeautifulSoup(html, "html.parser")
+    player_data = []
+    
+    # 获取玩家名称
+    name_tag = soup.select_one("div.user_head .name span")
+    player_name = name_tag.text.strip() if name_tag else f"玩家_{player_id}"
+    
+    # 解析各模式数据
+    rank_items = soup.select("div.rank .item")
+    
+    for item in rank_items:
+        try:
+            # 获取模式
+            img_tag = item.select_one("img")
+            if not img_tag or not img_tag.has_attr('src'):
+                continue
+                
+            src = img_tag['src']
+            mode = None
+            if 'mode-0.png' in src:
+                mode = 0
+            elif 'mode-1.png' in src:
+                mode = 1
+            elif 'mode-2.png' in src:
+                mode = 2
+            elif 'mode-3.png' in src:
+                mode = 3
+            elif 'mode-4.png' in src:
+                mode = 4
+            elif 'mode-5.png' in src:
+                mode = 5
+            elif 'mode-6.png' in src:
+                mode = 6
+            elif 'mode-7.png' in src:
+                mode = 7
+            elif 'mode-8.png' in src:
+                mode = 8
+            elif 'mode-9.png' in src:
+                mode = 9
+            else:
+                continue
+            
+            # 获取排名
+            rank_tag = item.select_one("p.rank")
+            if not rank_tag:
+                continue
+                
+            rank_text = rank_tag.text.strip()
+            if rank_text.startswith('#'):
+                try:
+                    rank = int(rank_text[1:].replace(',', ''))
+                except:
+                    continue
+            else:
+                continue
+            
+            # 获取其他数据
+            data_spans = item.select("p span")
+            exp = 0
+            playcount = 0
+            acc = 0.0
+            combo = 0
+            
+            for span in data_spans:
+                text = span.text.strip()
+                if text.startswith('Exp.'):
+                    try:
+                        exp = int(text.replace('Exp.', '').strip().replace(',', ''))
+                    except:
+                        pass
+                elif text.startswith('Playcount:'):
+                    try:
+                        playcount = int(text.replace('Playcount:', '').strip())
+                    except:
+                        pass
+                elif text.startswith('Acc.'):
+                    try:
+                        acc = float(text.replace('Acc.', '').replace('%', '').strip())
+                    except:
+                        pass
+                elif text.startswith('Combo:'):
+                    try:
+                        combo = int(text.replace('Combo:', '').strip())
+                    except:
+                        pass
+            
+            player_data.append({
+                "rank": rank,
+                "name": player_name,
+                "lv": 0,  # 个人主页不显示等级
+                "exp": exp,
+                "acc": acc,
+                "combo": combo,
+                "pc": playcount,
+                "mode": mode
+            })
+            
+        except Exception as e:
+            logger.warning("解析玩家 %s 模式 %s 数据时出错: %s", player_id, mode, e)
+            continue
+    
+    return player_data
+
+def crawl_player_profile(session, player_identifier):
+    """爬取玩家个人主页数据"""
+    try:
+        # 现在只支持玩家ID
+        if not player_identifier.isdigit():
+            logger.warning("玩家标识符必须是数字ID: %s", player_identifier)
+            return None
+        
+        url = PLAYER_PROFILE_URL.format(player_id=player_identifier)
+        
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        
+        player_data = parse_player_profile(resp.text, player_identifier)
+        return player_data
+        
+    except requests.exceptions.RequestException as e:
+        logger.error("爬取玩家 %s 个人主页失败: %s", player_identifier, e)
+        return None
+    except Exception as e:
+        logger.error("处理玩家 %s 数据时出错: %s", player_identifier, e)
+        return None
 
 def get_excel_filename(mode):
     if mode == 0:
@@ -522,18 +859,18 @@ def save_to_database(mode, df, crawl_time):
     try:
         data_to_insert = []
         for _, row in df.iterrows():
-            player_id = resolve_player_identity(row['name'], crawl_time)
+            player_id = resolve_player_identity(row['name'], crawl_time, row['player_id'])
             if player_id is not None:
                 data_to_insert.append((
-                    player_id, mode, row['rank'], row['name'], row['lv'], row['exp'],
+                    player_id, row['player_id'], mode, row['rank'], row['name'], row['lv'], row['exp'],
                     row['acc'], row['combo'], row['pc'], crawl_time
                 ))
         
         if data_to_insert:
             cursor.executemany('''
             INSERT OR IGNORE INTO player_rankings 
-            (player_id, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', data_to_insert)
             
             db_manager.get_connection().commit()
@@ -541,6 +878,62 @@ def save_to_database(mode, df, crawl_time):
     except Exception as e:
         logger.error("保存模式 %d 数据到数据库失败: %s", mode, e)
         db_manager.get_connection().rollback()
+
+def save_player_profile_to_database(player_data, crawl_time, player_identifier):
+    """将玩家个人主页数据保存到数据库"""
+    if not player_data:
+        return False
+    
+    db_manager = DatabaseManager()
+    cursor = db_manager.get_connection().cursor()
+    
+    try:
+        data_to_insert = []
+        for data in player_data:
+            player_id = resolve_player_identity(data['name'], crawl_time, player_identifier)
+            if player_id is not None:
+                data_to_insert.append((
+                    player_id, player_identifier, data['mode'], data['rank'], data['name'], data['lv'], data['exp'],
+                    data['acc'], data['combo'], data['pc'], crawl_time
+                ))
+        
+        if data_to_insert:
+            cursor.executemany('''
+            INSERT OR IGNORE INTO player_rankings 
+            (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', data_to_insert)
+            
+            # 更新玩家爬取状态
+            cursor.execute('''
+            INSERT OR REPLACE INTO player_crawl_status 
+            (player_identifier, last_crawled, crawl_count, success_count, last_error)
+            VALUES (?, ?, COALESCE((SELECT crawl_count FROM player_crawl_status WHERE player_identifier = ?), 0) + 1, 
+                   COALESCE((SELECT success_count FROM player_crawl_status WHERE player_identifier = ?), 0) + 1, NULL)
+            ''', (player_identifier, crawl_time, player_identifier, player_identifier))
+            
+            db_manager.get_connection().commit()
+            logger.info("玩家 %s 的 %d 条数据已保存到数据库", player_identifier, len(data_to_insert))
+            return True
+    except Exception as e:
+        logger.error("保存玩家 %s 数据到数据库失败: %s", player_identifier, e)
+        
+        # 记录错误
+        try:
+            cursor.execute('''
+            INSERT OR REPLACE INTO player_crawl_status 
+            (player_identifier, last_crawled, crawl_count, success_count, last_error)
+            VALUES (?, ?, COALESCE((SELECT crawl_count FROM player_crawl_status WHERE player_identifier = ?), 0) + 1, 
+                   COALESCE((SELECT success_count FROM player_crawl_status WHERE player_identifier = ?), 0), ?)
+            ''', (player_identifier, crawl_time, player_identifier, player_identifier, str(e)))
+            db_manager.get_connection().commit()
+        except:
+            pass
+            
+        db_manager.get_connection().rollback()
+        return False
+    
+    return False
 
 def check_excel_file_integrity(filename):
     """检查Excel文件是否完整可用"""
@@ -698,15 +1091,15 @@ def import_mode_data(mode):
                 
                 if player_id is not None:
                     batch_data.append((
-                        player_id, mode, row['rank'], name, row['lv'], row['exp'],
+                        player_id, None, mode, row['rank'], name, row['lv'], row['exp'],
                         row['acc'], row['combo'], row['pc'], sheet_time
                     ))
             
             if batch_data and (len(batch_data) >= 1000 or i == len(sheet_times) - 1):
                 cursor.executemany('''
                 INSERT OR IGNORE INTO player_rankings 
-                (player_id, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', batch_data)
                 
                 imported_count += len(batch_data)
@@ -730,8 +1123,8 @@ def import_mode_data(mode):
     if batch_data:
         cursor.executemany('''
         INSERT OR IGNORE INTO player_rankings 
-        (player_id, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', batch_data)
         imported_count += len(batch_data)
         conn.commit()
@@ -776,29 +1169,143 @@ def import_historical_data():
     if not HAS_TQDM:
         print("历史数据导入完成")
 
-def run_git_command_with_retry(command, max_retries=3, delay=5):
-    """运行Git命令并带有重试机制"""
-    for attempt in range(max_retries):
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-            if result.returncode == 0:
-                return result
-            elif attempt == max_retries - 1:
-                return result
-            else:
-                logger.warning(f"Git命令失败 (尝试 {attempt + 1}/{max_retries}): {result.stderr}")
-                time.sleep(delay)
-        except subprocess.TimeoutExpired:
-            if attempt == max_retries - 1:
-                raise
-            logger.warning(f"Git命令超时 (尝试 {attempt + 1}/{max_retries})")
-            time.sleep(delay)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            logger.warning(f"Git命令异常 (尝试 {attempt + 1}/{max_retries}): {e}")
-            time.sleep(delay)
-    return None
+def load_player_config():
+    """加载玩家配置文件"""
+    players = []
+    
+    if not os.path.exists(PLAYER_CONFIG_FILE):
+        logger.info("玩家配置文件不存在，创建空文件: %s", PLAYER_CONFIG_FILE)
+        with open(PLAYER_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            f.write("# 每行一个玩家ID（必须是数字）\n")
+            f.write("# 例如:\n")
+            f.write("# 923177\n")
+            f.write("# 123456\n")
+        return players
+    
+    try:
+        with open(PLAYER_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    players.append(line)
+        
+        logger.info("从配置文件加载了 %d 个玩家", len(players))
+        return players
+    except Exception as e:
+        logger.error("加载玩家配置文件失败: %s", e)
+        return []
+
+def add_players_to_queue(players):
+    """将玩家添加到爬取队列"""
+    for player in players:
+        player_queue.put(player)
+    logger.info("添加了 %d 个玩家到爬取队列", len(players))
+
+def get_players_from_leaderboard(df_list):
+    """从排行榜数据中提取玩家ID"""
+    players = set()
+    
+    for df in df_list:
+        if not df.empty and 'player_id' in df.columns:
+            for player_id in df['player_id']:
+                if player_id and player_id not in players:
+                    players.add(player_id)
+    
+    return list(players)
+
+def run_player_crawler():
+    """运行玩家个人主页爬取器"""
+    global player_crawl_in_progress, last_player_crawl_time
+    
+    with player_crawl_lock:
+        if player_crawl_in_progress:
+            logger.info("玩家爬取器已在运行，跳过")
+            return
+        
+        player_crawl_in_progress = True
+    
+    try:
+        logger.info("开始玩家个人主页爬取周期")
+        last_player_crawl_time = datetime.now()
+        
+        session = requests.Session()
+        session.cookies.update(COOKIES)
+        session.headers.update(HEADERS)
+        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        
+        total_players = player_queue.qsize()
+        if total_players == 0:
+            logger.info("爬取队列为空，跳过")
+            return
+        
+        logger.info("开始爬取 %d 个玩家的个人主页数据", total_players)
+        
+        successful_crawls = 0
+        failed_crawls = 0
+        
+        if HAS_TQDM:
+            pbar = tqdm(total=total_players, desc="玩家主页爬取", unit="玩家")
+        else:
+            print(f"开始爬取 {total_players} 个玩家的个人主页数据...")
+        
+        while not player_queue.empty():
+            with stop_lock:
+                if stop_requested:
+                    logger.info("玩家爬取被中断")
+                    break
+            
+            try:
+                player_identifier = player_queue.get_nowait()
+            except queue.Empty:
+                break
+            
+            try:
+                player_data = crawl_player_profile(session, player_identifier)
+                crawl_time = datetime.now()
+                
+                if player_data and save_player_profile_to_database(player_data, crawl_time, player_identifier):
+                    successful_crawls += 1
+                    if HAS_TQDM:
+                        pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+                else:
+                    failed_crawls += 1
+                    if HAS_TQDM:
+                        pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+                
+                # 延迟以避免请求过于频繁
+                time.sleep(3)  # 增加到3秒，减轻服务器压力
+                
+            except Exception as e:
+                logger.error("处理玩家 %s 时出错: %s", player_identifier, e)
+                failed_crawls += 1
+                if HAS_TQDM:
+                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+            finally:
+                if HAS_TQDM:
+                    pbar.update(1)
+                player_queue.task_done()
+        
+        if HAS_TQDM:
+            pbar.close()
+        
+        logger.info("玩家个人主页爬取完成: 成功 %d, 失败 %d", successful_crawls, failed_crawls)
+        
+    except Exception as e:
+        logger.error("玩家爬取周期发生错误: %s", e)
+    finally:
+        with player_crawl_lock:
+            player_crawl_in_progress = False
+
+def start_player_crawler_thread():
+    """启动玩家爬取器线程"""
+    if player_queue.empty():
+        logger.info("玩家队列为空，不启动爬取线程")
+        return
+    
+    thread = Thread(target=run_player_crawler, daemon=True)
+    thread.start()
+    logger.info("玩家爬取器线程已启动")
+    return thread
 
 def git_check_updates():
     """检查远程Git仓库是否有更新"""
@@ -810,25 +1317,26 @@ def git_check_updates():
         original_cwd = os.getcwd()
         os.chdir(GIT_REPO_PATH)
         
-        result = run_git_command_with_retry(["git", "remote", "-v"])
-        if not result or not result.stdout.strip():
+        result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
+        if not result.stdout.strip():
             logger.info("未配置Git远程仓库，跳过更新检查")
             os.chdir(original_cwd)
             return False
         
-        result = run_git_command_with_retry(["git", "fetch", "origin"])
-        if not result or result.returncode != 0:
-            logger.warning("Git fetch失败: %s", result.stderr if result else "未知错误")
+        result = subprocess.run(["git", "fetch", "origin"], capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning("Git fetch失败: %s", result.stderr)
             os.chdir(original_cwd)
             return False
         
-        result = run_git_command_with_retry(
-            ["git", "diff", "--name-only", "HEAD", "origin/main", "--", "*.db", "*.xlsx"]
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "origin/main", "--", "*.db", "*.xlsx"],
+            capture_output=True, text=True
         )
         
         os.chdir(original_cwd)
         
-        if result and result.stdout.strip():
+        if result.stdout.strip():
             updated_files = result.stdout.strip().split('\n')
             logger.info("发现远程更新文件: %s", updated_files)
             return True
@@ -836,51 +1344,94 @@ def git_check_updates():
             logger.info("远程仓库没有.db或.xlsx文件的更新")
             return False
             
+    except subprocess.CalledProcessError as e:
+        logger.warning("Git检查更新失败: %s", e)
+        return False
     except Exception as e:
         logger.warning("Git检查更新发生意外错误: %s", e)
         return False
 
-def git_merge_data_files():
-    """合并远程数据文件而不是直接覆盖"""
+def git_pull_data_files():
+    """从远程Git仓库拉取文件"""
     try:
         if not os.path.exists(os.path.join(GIT_REPO_PATH, '.git')):
-            logger.info("当前目录不是Git仓库，跳过Git合并")
+            logger.info("当前目录不是Git仓库，跳过Git拉取")
             return False
+            
+        # 添加用户确认环节
+        print("\n" + "="*60)
+        print("检测到远程仓库有更新！")
+        print("更新文件包括: catch.xlsx, key.xlsx, malody_rankings.db 等数据文件")
+        print("这些更新将覆盖您本地的数据文件。")
+        print("="*60)
+        print("您有10秒时间决定是否拉取更新：")
+        print("  - 输入 'y' 或 'yes' 确认拉取")
+        print("  - 输入 'n' 或 'no' 跳过拉取")
+        print("  - 10秒内无响应将自动跳过")
+        print("="*60)
+        
+        # 设置10秒超时
+        try:
+            import select
+            import sys
+            
+            print("请确认是否拉取更新 (y/n, 10秒超时): ", end='', flush=True)
+            start_time = time.time()
+            
+            while time.time() - start_time < 10:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    user_input = sys.stdin.readline().strip().lower()
+                    if user_input in ['y', 'yes']:
+                        print("确认拉取更新...")
+                        break
+                    elif user_input in ['n', 'no']:
+                        print("跳过拉取更新。")
+                        return False
+                    else:
+                        print("无效输入，请输入 y 或 n: ", end='', flush=True)
+                time.sleep(0.1)
+            else:
+                print("\n10秒超时，自动跳过拉取更新。")
+                return False
+                
+        except ImportError:
+            # 如果select不可用，使用简单方法
+            print("请确认是否拉取更新 (y/n, 10秒超时): ", end='', flush=True)
+            user_input = input()
+            if user_input.lower() in ['y', 'yes']:
+                print("确认拉取更新...")
+            else:
+                print("跳过拉取更新。")
+                return False
             
         original_cwd = os.getcwd()
         os.chdir(GIT_REPO_PATH)
         
-        # 先保存当前工作状态
-        result = run_git_command_with_retry(["git", "stash"])
-        if result and result.returncode != 0:
-            logger.warning("Git stash失败: %s", result.stderr)
+        DatabaseManager().close_connection()
         
-        # 获取远程更新
-        result = run_git_command_with_retry(["git", "fetch", "origin"])
-        if not result or result.returncode != 0:
-            logger.warning("Git fetch失败: %s", result.stderr if result else "未知错误")
-            os.chdir(original_cwd)
-            return False
+        excel_files = [get_excel_filename(mode) for mode in MODES]
+        files_to_pull = [f for f in excel_files if os.path.exists(f)]
+        files_to_pull.append(DB_FILE)
         
-        # 尝试合并，如果有冲突则采用ours策略（保留本地更改）
-        result = run_git_command_with_retry(["git", "merge", "origin/main", "-Xours"])
-        if result and result.returncode == 0:
-            logger.info("Git合并成功")
-            success = True
-        else:
-            logger.warning("Git合并失败，尝试中止合并: %s", result.stderr if result else "未知错误")
-            run_git_command_with_retry(["git", "merge", "--abort"])
-            success = False
-        
-        # 恢复之前的工作状态
-        result = run_git_command_with_retry(["git", "stash", "pop"])
-        if result and result.returncode != 0:
-            logger.warning("Git stash pop失败: %s", result.stderr)
+        success = True
+        for file in files_to_pull:
+            result = subprocess.run(
+                ["git", "checkout", "origin/main", "--", file],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                logger.info("已拉取文件: %s", file)
+            else:
+                logger.warning("拉取文件 %s 失败: %s", file, result.stderr)
+                success = False
         
         os.chdir(original_cwd)
         return success
+    except subprocess.CalledProcessError as e:
+        logger.warning("Git拉取文件失败: %s", e)
+        return False
     except Exception as e:
-        logger.warning("Git合并发生意外错误: %s", e)
+        logger.warning("Git拉取文件发生意外错误: %s", e)
         return False
 
 def git_add_commit_push(has_changes=True):
@@ -897,8 +1448,8 @@ def git_add_commit_push(has_changes=True):
         original_cwd = os.getcwd()
         os.chdir(GIT_REPO_PATH)
         
-        result = run_git_command_with_retry(["git", "remote", "-v"])
-        if not result or not result.stdout.strip():
+        result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
+        if not result.stdout.strip():
             logger.info("未配置Git远程仓库，跳过推送")
             os.chdir(original_cwd)
             return True
@@ -908,35 +1459,37 @@ def git_add_commit_push(has_changes=True):
         files_to_add.append(DB_FILE)
         
         for file in files_to_add:
-            result = run_git_command_with_retry(["git", "add", file])
-            if result and result.returncode != 0:
+            result = subprocess.run(["git", "add", file], capture_output=True, text=True)
+            if result.returncode != 0:
                 logger.warning("添加文件 %s 失败: %s", file, result.stderr)
         
-        result = run_git_command_with_retry(["git", "status", "--porcelain"])
-        if not result or not result.stdout.strip():
+        result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        if not result.stdout.strip():
             logger.info("没有文件更改，跳过Git提交")
             os.chdir(original_cwd)
             return True
         
-        commit_message = get_git_commit_message()
-        result = run_git_command_with_retry(["git", "commit", "-m", commit_message])
-        if result and result.returncode == 0:
-            logger.info("Git提交成功: %s", commit_message)
+        result = subprocess.run(["git", "commit", "-m", GIT_COMMIT_MESSAGE], capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info("Git提交成功: %s", GIT_COMMIT_MESSAGE)
         else:
-            logger.warning("Git提交失败: %s", result.stderr if result else "未知错误")
+            logger.warning("Git提交失败: %s", result.stderr)
             os.chdir(original_cwd)
             return False
         
-        result = run_git_command_with_retry(["git", "push"])
-        if result and result.returncode == 0:
+        result = subprocess.run(["git", "push"], capture_output=True, text=True)
+        if result.returncode == 0:
             logger.info("Git推送成功")
             success = True
         else:
-            logger.warning("Git推送失败: %s", result.stderr if result else "未知错误")
+            logger.warning("Git推送失败: %s", result.stderr)
             success = False
         
         os.chdir(original_cwd)
         return success
+    except subprocess.CalledProcessError as e:
+        logger.warning("Git操作失败: %s", e)
+        return False
     except Exception as e:
         logger.warning("Git操作发生意外错误: %s", e)
         return False
@@ -982,24 +1535,21 @@ def check_data_changed(mode, df):
         
     return True
 
-def run_crawler_cycle():
+def run_crawler_cycle(crawl_players=False):
+    """运行爬取周期
+    
+    Args:
+        crawl_players: 是否爬取玩家主页数据
+    """
     try:
         if git_check_updates():
-            logger.info("检测到远程仓库有更新，正在合并数据文件...")
-            if git_merge_data_files():
-                logger.info("数据文件合并完成，重新导入更新数据...")
+            logger.info("检测到远程仓库有更新，正在拉取数据文件...")
+            if git_pull_data_files():
+                logger.info("数据文件拉取完成，重新初始化数据库...")
                 DatabaseManager().close_connection()
-                
-                # 只重新导入最近的数据，避免重复工作
-                for mode in MODES:
-                    try:
-                        imported = import_mode_data(mode)
-                        if imported > 0:
-                            logger.info("模式 %d 重新导入 %d 条数据", mode, imported)
-                    except Exception as e:
-                        logger.error("模式 %d 重新导入失败: %s", mode, e)
+                init_database()
             else:
-                logger.warning("数据文件合并失败，继续使用本地数据")
+                logger.warning("数据文件拉取失败，继续使用本地数据")
         else:
             logger.info("未检测到远程更新或Git不可用，继续使用本地数据")
     except Exception as e:
@@ -1016,6 +1566,7 @@ def run_crawler_cycle():
     logger.info("开始爬取周期: %s", start_time)
 
     has_changes = False
+    all_dfs = []
     
     for mode in MODES:
         try:
@@ -1026,6 +1577,7 @@ def run_crawler_cycle():
             
             logger.info("处理模式: %d", mode)
             df = crawl_mode_player(session, mode)
+            all_dfs.append(df)
             
             if df.empty:
                 logger.warning("模式 %d 获取数据为空，跳过", mode)
@@ -1044,6 +1596,17 @@ def run_crawler_cycle():
         except Exception as e:
             logger.exception("处理模式 %d 时发生错误", mode)
     
+    # 只有在明确要求时才爬取玩家主页
+    if crawl_players and all_dfs:
+        leaderboard_players = get_players_from_leaderboard(all_dfs)
+        if leaderboard_players:
+            add_players_to_queue(leaderboard_players)
+            logger.info("从排行榜添加了 %d 个玩家到爬取队列", len(leaderboard_players))
+        
+        # 启动玩家爬取器（在后台运行）
+        start_player_crawler_thread()
+    
+    # 自动提交保持不变，不需要确认
     try:
         git_add_commit_push(has_changes)
     except Exception as e:
@@ -1054,8 +1617,51 @@ def run_crawler_cycle():
     logger.info("爬取周期完成, 用时: %.2f秒", duration)
     logger.info("=" * 50)
 
-def main():
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='Malody排行榜爬虫')
+    parser.add_argument('--all', action='store_true', 
+                       help='爬取排行榜和玩家主页数据')
+    parser.add_argument('--leaderboard-only', action='store_true', 
+                       help='只爬取排行榜数据（默认）')
+    parser.add_argument('--players-only', action='store_true', 
+                       help='只爬取玩家主页数据')
+    parser.add_argument('--migrate-db', action='store_true', 
+                       help='执行数据库迁移（添加uid字段）')
+    parser.add_argument('--import-only', action='store_true', 
+                       help='只导入历史数据')
+    parser.add_argument('--once', action='store_true', 
+                       help='运行一次爬取周期后退出')
+    
+    return parser.parse_args()
+
+def run_players_only():
+    """只运行玩家主页爬取"""
     init_database()
+    config_players = load_player_config()
+    if config_players:
+        add_players_to_queue(config_players)
+        run_player_crawler()
+    else:
+        logger.info("没有配置玩家，跳过爬取")
+    DatabaseManager().close_connection()
+
+def main():
+    args = parse_arguments()
+    
+    # 处理数据库迁移
+    if args.migrate_db:
+        migrate_database()
+        return
+    
+    # 初始化数据库
+    init_database()
+    
+    # 加载配置文件中的玩家
+    config_players = load_player_config()
+    if config_players:
+        add_players_to_queue(config_players)
+        logger.info("从配置文件加载了 %d 个玩家", len(config_players))
     
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
@@ -1070,55 +1676,45 @@ def main():
     else:
         logger.info("数据库中已有 %d 条记录，跳过历史数据导入", count)
     
-    try:
-        while True:
-            with stop_lock:
-                if stop_requested:
-                    logger.info("程序被终止")
-                    break
-            
-            try:
-                run_crawler_cycle()
-            except Exception as e:
-                logger.exception("主循环发生未处理异常")
-            
-            logger.info("等待30分钟后重启...")
-            
-            for i in range(30):
+    # 根据参数执行不同的操作
+    if args.import_only:
+        DatabaseManager().close_connection()
+        return
+    elif args.players_only:
+        run_players_only()
+        return
+    elif args.once:
+        # 单次运行
+        run_crawler_cycle(crawl_players=args.all)
+        DatabaseManager().close_connection()
+        return
+    else:
+        # 持续运行模式
+        try:
+            while True:
                 with stop_lock:
                     if stop_requested:
                         logger.info("程序被终止")
                         break
                 
-                time.sleep(60)
-                gc.collect()
-    finally:
-        DatabaseManager().close_connection()
+                try:
+                    # 默认只爬排行榜，只有--all参数时才爬玩家主页
+                    run_crawler_cycle(crawl_players=args.all)
+                except Exception as e:
+                    logger.exception("主循环发生未处理异常")
+                
+                logger.info("等待30分钟后重启...")
+                
+                for i in range(30):
+                    with stop_lock:
+                        if stop_requested:
+                            logger.info("程序被终止")
+                            break
+                    
+                    time.sleep(60)
+                    gc.collect()
+        finally:
+            DatabaseManager().close_connection()
 
 if __name__ == "__main__":
-    if "--once" in sys.argv:
-        init_database()
-        
-        db_manager = DatabaseManager()
-        cursor = db_manager.get_connection().cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM player_rankings")
-        count = cursor.fetchone()[0]
-        
-        if count == 0:
-            logger.info("开始导入历史数据...")
-            import_historical_data()
-            logger.info("历史数据导入完成")
-        else:
-            logger.info("数据库中已有 %d 条记录，跳过历史数据导入", count)
-        
-        run_crawler_cycle()
-        DatabaseManager().close_connection()
-    elif "--import-only" in sys.argv:
-        init_database()
-        logger.info("开始导入历史数据...")
-        import_historical_data()
-        logger.info("历史数据导入完成")
-        DatabaseManager().close_connection()
-    else:
-        main()
+    main()

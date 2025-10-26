@@ -18,6 +18,41 @@ import shutil
 import re
 import math
 
+
+# PowerShell 颜色支持修复
+def enable_powershell_colors():
+    """在 PowerShell 中启用 ANSI 颜色支持"""
+    if sys.platform == "win32":
+        try:
+            # 方法1: 通过设置环境变量启用虚拟终端
+            os.environ["TERM"] = "xterm-256color"
+            
+            # 方法2: 使用 ctypes 启用虚拟终端处理
+            if hasattr(sys, 'getwindowsversion'):
+                import ctypes
+                from ctypes import wintypes
+                
+                kernel32 = ctypes.windll.kernel32
+                STD_OUTPUT_HANDLE = -11
+                
+                # 获取标准输出句柄
+                hstdout = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+                
+                # 获取当前控制台模式
+                mode = wintypes.DWORD()
+                if kernel32.GetConsoleMode(hstdout, ctypes.byref(mode)):
+                    # 启用虚拟终端处理
+                    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                    new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    kernel32.SetConsoleMode(hstdout, new_mode)
+                    return True
+        except:
+            pass
+    return False
+
+# 在程序启动时启用 PowerShell 颜色
+enable_powershell_colors()
+
 # 修复Python 3.12中SQLite datetime适配器的弃用警告
 def adapt_datetime(dt):
     return dt.isoformat()
@@ -60,59 +95,44 @@ class Colors:
 
 def color_enabled():
     """检查当前环境是否支持颜色输出"""
-    # 检查是否在终端中运行（不是重定向到文件）
-    if not sys.stdout.isatty():
-        return False
-    
-    # 检查环境变量
-    if os.environ.get('NO_COLOR'):
-        return False
-    
-    # 检查平台和终端类型
-    platform = sys.platform
-    
-    # Windows系统检测
-    if platform == "win32":
-        # 检查是否在支持ANSI的终端中（如Windows Terminal、PowerShell 5.1+、Git Bash等）
-        term = os.environ.get('TERM', '')
-        # 检查是否是Windows Terminal
-        if 'WT_SESSION' in os.environ:
-            return True
-        # 检查是否是PowerShell 5.1或更高版本
+    if sys.platform == "win32":
+        # 在 Windows 上检查是否在支持颜色的终端中运行
         try:
-            # 通过检查PSVersionTable来判断PowerShell版本
-            if 'PSVersionTable' in os.environ:
+            # 检查是否在 Windows Terminal、PowerShell 5.1+ 或支持 ANSI 的 CMD 中运行
+            term_program = os.environ.get('TERM_PROGRAM', '')
+            term = os.environ.get('TERM', '')
+            
+            # Windows Terminal 或现代 PowerShell
+            if 'WindowsTerminal' in term_program or 'TERM' in os.environ:
                 return True
-        except:
-            pass
-        # 检查是否在Git Bash、Cygwin等兼容环境中
-        if 'TERM' in os.environ and ('xterm' in term or 'cygwin' in term):
-            return True
-        # 对于传统CMD，只有Windows 10周年更新(1607)及以上版本支持ANSI
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            # 检查是否支持虚拟终端序列
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            stdout_handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(stdout_handle, ctypes.byref(mode)):
-                if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            
+            # 检查 PowerShell 版本（5.1+ 支持 ANSI）
+            import subprocess
+            result = subprocess.run(['powershell', '$PSVersionTable.PSVersion.Major'], 
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                ps_version = int(result.stdout.strip())
+                if ps_version >= 5:
                     return True
-                # 尝试启用虚拟终端支持
-                kernel32.SetConsoleMode(stdout_handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-                if kernel32.GetConsoleMode(stdout_handle, ctypes.byref(mode)):
-                    if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
-                        return True
+                    
+            # 最后的手段：尝试检测控制台能力
+            import ctypes
+            from ctypes import wintypes
+            
+            kernel32 = ctypes.windll.kernel32
+            STD_OUTPUT_HANDLE = -11
+            hstdout = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+            
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(hstdout, ctypes.byref(mode)):
+                ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                return (mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+                
         except:
             pass
         return False
     else:
-        # Linux、macOS、Termux等Unix-like系统通常支持颜色
-        term = os.environ.get('TERM', '')
-        # 检查是否是dumb终端或不支持颜色的终端
-        if term == 'dumb':
-            return False
+        # 非 Windows 系统通常支持颜色
         return True
 
 def colorize(text, color):
@@ -134,6 +154,46 @@ def db_safe_operation(func):
             print(colorize(f"操作错误: {e}", Colors.RED))
             return False
     return wrapper
+
+def format_change(change_value, reverse=False, is_percent=False):
+    """格式化变化值，添加颜色"""
+    if change_value is None:
+        return "N/A"
+    
+    if change_value == 0:
+        return "0"
+    
+    if is_percent:
+        change_str = f"{change_value:+.2f}%"
+    else:
+        change_str = f"{change_value:+d}"
+    
+    # 对于排名变化，负数表示进步（排名上升）
+    if reverse:
+        if change_value < 0:
+            return colorize(change_str, Colors.GREEN)  # 进步
+        elif change_value > 0:
+            return colorize(change_str, Colors.RED)    # 退步
+    else:
+        if change_value > 0:
+            return colorize(change_str, Colors.GREEN)  # 增加
+        elif change_value < 0:
+            return colorize(change_str, Colors.RED)    # 减少
+    
+    return change_str
+
+def format_number(number):
+    """格式化大数字，添加千位分隔符"""
+    if number is None:
+        return "N/A"
+    return f"{number:,}"
+
+def get_terminal_width():
+    """获取终端宽度"""
+    try:
+        return shutil.get_terminal_size().columns
+    except:
+        return 80
 
 class MalodyViz(cmd.Cmd):
     """Malody排行榜数据可视化工具"""
@@ -240,6 +300,7 @@ class MalodyViz(cmd.Cmd):
                 ("history <玩家名> [模式] [天数]", "查看玩家历史排名并生成图表"),
                 ("compare <玩家1> <玩家2> [...] [模式] [天数]", "比较多个玩家的排名变化"),
                 ("top_chart [数量] [模式]", "生成顶级玩家分布图表"),
+                ("trend <起始日期> [模式] [显示项]", "统计玩家数据变化趋势"),
                 ("alias <原名> <新名>", "设置玩家别名"),
                 ("export <类型> [模式] [天数]", "导出数据为CSV文件"),
                 ("update", "更新数据（调用爬虫脚本）"),
@@ -1003,6 +1064,441 @@ class MalodyViz(cmd.Cmd):
         
         print(colorize(f"\n已生成顶级玩家分布图表: {filepath}", Colors.GREEN))
         print(colorize(f"图表尺寸已调整为适应 {limit} 名玩家", Colors.YELLOW))
+    
+    @db_safe_operation
+    def do_trend(self, arg):
+        """
+        统计玩家数据变化趋势
+        
+        用法: trend <起始日期> [模式] [显示项]
+        参数:
+          起始日期 - 格式为YYYY-MM-DD，统计从该日期开始的变化
+          模式     - 可选，模式编号，默认为当前模式
+          显示项   - 可选，要显示的统计项，用逗号分隔，如: rank,lv,exp,acc,combo,pc
+        
+        示例:
+          trend 2024-01-01                    # 统计从2024年1月1日开始的玩家数据变化
+          trend 2024-01-01 0                  # 统计模式0从2024年1月1日开始的玩家数据变化
+          trend 2024-01-01 0 rank,exp,acc     # 只显示排名、经验和准确率的变化
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请输入起始日期", Colors.RED))
+            return
+        
+        # 解析起始日期
+        try:
+            start_date = datetime.strptime(args[0], "%Y-%m-%d")
+        except ValueError:
+            print(colorize("错误: 日期格式应为 YYYY-MM-DD", Colors.RED))
+            return
+        
+        mode = self.current_mode
+        display_fields = ["rank", "lv", "exp", "acc", "combo", "pc"]  # 默认显示所有项
+        
+        if len(args) > 1:
+            # 检查第二个参数是否为模式
+            if args[1].isdigit() and int(args[1]) in self.mode_names:
+                mode = int(args[1])
+                # 检查是否有显示项参数
+                if len(args) > 2:
+                    display_fields = [field.strip() for field in args[2].split(",")]
+            else:
+                # 第二个参数是显示项
+                display_fields = [field.strip() for field in args[1].split(",")]
+        
+        # 验证显示项
+        valid_fields = ["rank", "lv", "exp", "acc", "combo", "pc"]
+        invalid_fields = [field for field in display_fields if field not in valid_fields]
+        if invalid_fields:
+            print(colorize(f"错误: 无效的显示项: {', '.join(invalid_fields)}", Colors.RED))
+            print(colorize(f"有效的显示项: {', '.join(valid_fields)}", Colors.YELLOW))
+            return
+        
+        cursor = self.conn.cursor()
+        
+        # 获取起始日期的数据（如果一天内有多个数据，取第一个）
+        cursor.execute(
+            """
+            SELECT crawl_time 
+            FROM player_rankings 
+            WHERE mode = ? AND DATE(crawl_time) >= DATE(?)
+            ORDER BY crawl_time
+            LIMIT 1
+            """,
+            (mode, start_date)
+        )
+        
+        start_result = cursor.fetchone()
+        
+        if not start_result:
+            print(colorize(f"错误: 在 {start_date.date()} 及之后没有找到模式 {mode} 的数据", Colors.RED))
+            return
+        
+        start_crawl_time = start_result[0]
+        
+        # 获取最新数据
+        cursor.execute(
+            "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
+            (mode,)
+        )
+        end_crawl_time = cursor.fetchone()[0]
+        
+        if not end_crawl_time:
+            print(colorize(f"错误: 模式 {mode} 没有最新数据", Colors.RED))
+            return
+        
+        # 获取起始日期的玩家数据
+        cursor.execute(
+            """
+            SELECT player_id, name, rank, lv, exp, acc, combo, pc
+            FROM player_rankings
+            WHERE mode = ? AND crawl_time = ?
+            ORDER BY rank
+            """,
+            (mode, start_crawl_time)
+        )
+        
+        start_players = {row[0]: (row[1], row[2], row[3], row[4], row[5], row[6], row[7]) for row in cursor.fetchall()}
+        
+        # 获取最新日期的玩家数据
+        cursor.execute(
+            """
+            SELECT player_id, name, rank, lv, exp, acc, combo, pc
+            FROM player_rankings
+            WHERE mode = ? AND crawl_time = ?
+            ORDER BY rank
+            """,
+            (mode, end_crawl_time)
+        )
+        
+        end_players = {row[0]: (row[1], row[2], row[3], row[4], row[5], row[6], row[7]) for row in cursor.fetchall()}
+        
+        # 分析变化
+        all_player_ids = set(start_players.keys()) | set(end_players.keys())
+        
+        trend_data = []
+        
+        for player_id in all_player_ids:
+            in_start = player_id in start_players
+            in_end = player_id in end_players
+            
+            if in_start and in_end:
+                # 一直在榜的玩家
+                start_name, start_rank, start_lv, start_exp, start_acc, start_combo, start_pc = start_players[player_id]
+                end_name, end_rank, end_lv, end_exp, end_acc, end_combo, end_pc = end_players[player_id]
+                
+                # 检查是否改名
+                current_name = end_name if end_name != start_name else start_name
+                
+                # 检查是否有任何变化
+                has_changes = (
+                    start_rank != end_rank or
+                    start_lv != end_lv or
+                    start_exp != end_exp or
+                    start_acc != end_acc or
+                    start_combo != end_combo or
+                    start_pc != end_pc
+                )
+                
+                # 如果用户指定了显示字段，检查这些字段是否有变化
+                if display_fields:
+                    field_has_changes = False
+                    for field in display_fields:
+                        if field == "rank" and start_rank != end_rank:
+                            field_has_changes = True
+                            break
+                        elif field == "lv" and start_lv != end_lv:
+                            field_has_changes = True
+                            break
+                        elif field == "exp" and start_exp != end_exp:
+                            field_has_changes = True
+                            break
+                        elif field == "acc" and start_acc != end_acc:
+                            field_has_changes = True
+                            break
+                        elif field == "combo" and start_combo != end_combo:
+                            field_has_changes = True
+                            break
+                        elif field == "pc" and start_pc != end_pc:
+                            field_has_changes = True
+                            break
+                    
+                    # 如果没有变化且用户指定了显示字段，跳过这个玩家
+                    if not field_has_changes:
+                        continue
+                
+                trend_data.append({
+                    'player_id': player_id,
+                    'name': current_name,
+                    'status': '=',  # 一直在榜
+                    'start_rank': start_rank,
+                    'end_rank': end_rank,
+                    'rank_change': end_rank - start_rank,  # 负数表示进步
+                    'start_lv': start_lv,
+                    'end_lv': end_lv,
+                    'lv_change': end_lv - start_lv,
+                    'start_exp': start_exp,
+                    'end_exp': end_exp,
+                    'exp_change': end_exp - start_exp,
+                    'start_acc': start_acc,
+                    'end_acc': end_acc,
+                    'acc_change': end_acc - start_acc,
+                    'start_combo': start_combo,
+                    'end_combo': end_combo,
+                    'combo_change': end_combo - start_combo,
+                    'start_pc': start_pc,
+                    'end_pc': end_pc,
+                    'pc_change': end_pc - start_pc,
+                    'has_changes': has_changes
+                })
+            elif in_start and not in_end:
+                # 掉出榜的玩家
+                start_name, start_rank, start_lv, start_exp, start_acc, start_combo, start_pc = start_players[player_id]
+                
+                trend_data.append({
+                    'player_id': player_id,
+                    'name': start_name,
+                    'status': '-',  # 掉出榜
+                    'start_rank': start_rank,
+                    'end_rank': None,
+                    'rank_change': None,
+                    'start_lv': start_lv,
+                    'end_lv': None,
+                    'lv_change': None,
+                    'start_exp': start_exp,
+                    'end_exp': None,
+                    'exp_change': None,
+                    'start_acc': start_acc,
+                    'end_acc': None,
+                    'acc_change': None,
+                    'start_combo': start_combo,
+                    'end_combo': None,
+                    'combo_change': None,
+                    'start_pc': start_pc,
+                    'end_pc': None,
+                    'pc_change': None,
+                    'has_changes': True  # 掉出榜本身就是变化
+                })
+            else:
+                # 新上榜的玩家
+                end_name, end_rank, end_lv, end_exp, end_acc, end_combo, end_pc = end_players[player_id]
+                
+                trend_data.append({
+                    'player_id': player_id,
+                    'name': end_name,
+                    'status': '+',  # 新上榜
+                    'start_rank': None,
+                    'end_rank': end_rank,
+                    'rank_change': None,
+                    'start_lv': None,
+                    'end_lv': end_lv,
+                    'lv_change': None,
+                    'start_exp': None,
+                    'end_exp': end_exp,
+                    'exp_change': None,
+                    'start_acc': None,
+                    'end_acc': end_acc,
+                    'acc_change': None,
+                    'start_combo': None,
+                    'end_combo': end_combo,
+                    'combo_change': None,
+                    'start_pc': None,
+                    'end_pc': end_pc,
+                    'pc_change': None,
+                    'has_changes': True  # 新上榜本身就是变化
+                })
+        
+        # 如果没有数据，显示提示
+        if not trend_data:
+            print(colorize(f"\n在指定的时间范围内，模式 {mode} 没有发现数据变化", Colors.YELLOW))
+            return
+        
+        # 按结束排名排序（掉出榜的玩家排最后）
+        trend_data.sort(key=lambda x: (x['end_rank'] is None, x['end_rank'] or 9999))
+        
+        # 显示结果
+        mode_name = self.mode_names.get(mode, "未知")
+        print(colorize(f"\n玩家数据变化趋势 (模式 {mode} - {mode_name})", Colors.CYAN))
+        print(colorize(f"时间范围: {start_crawl_time} 到 {end_crawl_time}", Colors.YELLOW))
+        
+        # 自适应终端宽度
+        terminal_width = get_terminal_width()
+        separator_width = min(terminal_width, 120)
+        
+        print(colorize("=" * separator_width, Colors.CYAN))
+        
+        # 构建表头
+        header_parts = []
+        format_specs = []
+        
+        # 状态和玩家名总是显示
+        header_parts.extend(["状态", "玩家名"])
+        format_specs.extend([8, 20])  # 状态和玩家名的宽度
+        
+        # 根据选择的字段添加表头
+        field_configs = {
+            "rank": ("排名", 10, 10, 10),
+            "lv": ("等级", 10, 10, 10),
+            "exp": ("经验", 12, 12, 10),
+            "acc": ("准确率", 12, 12, 12),
+            "combo": ("连击", 10, 10, 10),
+            "pc": ("游玩", 10, 10, 10)
+        }
+        
+        for field in display_fields:
+            if field in field_configs:
+                name, start_width, end_width, change_width = field_configs[field]
+                header_parts.extend([f"起始{name}", f"结束{name}", f"{name}变化"])
+                format_specs.extend([start_width, end_width, change_width])
+        
+        # 计算总宽度
+        total_width = sum(format_specs) + (len(format_specs) - 1) * 2  # 每列之间2个空格
+        
+        # 如果总宽度超过终端宽度，调整玩家名宽度
+        if total_width > separator_width:
+            excess_width = total_width - separator_width
+            player_name_width = max(10, 20 - excess_width)  # 玩家名最小宽度为10
+            format_specs[1] = player_name_width
+        
+        # 构建格式字符串
+        format_parts = []
+        for width in format_specs:
+            format_parts.append(f"{{:<{width}}}")
+        header_format = "  ".join(format_parts)
+        
+        # 打印表头
+        print(colorize(header_format.format(*header_parts), Colors.BOLD))
+        print(colorize("-" * separator_width, Colors.CYAN))
+        
+        # 打印数据行
+        for player in trend_data:
+            row_parts = []
+            
+            # 状态和玩家名
+            status_symbol = player['status']
+            if status_symbol == '+':
+                status_display = colorize("[+]", Colors.GREEN)
+            elif status_symbol == '-':
+                status_display = colorize("[-]", Colors.RED)
+            else:
+                status_display = colorize("[=]", Colors.BLUE)
+            
+            # 处理玩家名长度
+            player_name = player['name']
+            max_name_width = format_specs[1]
+            if len(player_name) > max_name_width:
+                player_name = player_name[:max_name_width-3] + "..."
+            
+            row_parts.extend([status_display, player_name])
+            
+            # 根据选择的字段添加数据
+            for field in display_fields:
+                if field == "rank":
+                    row_parts.extend([
+                        str(player['start_rank']) if player['start_rank'] is not None else "N/A",
+                        str(player['end_rank']) if player['end_rank'] is not None else "掉出",
+                        format_change(player['rank_change'], reverse=True)  # 排名变化：负数表示进步
+                    ])
+                elif field == "lv":
+                    row_parts.extend([
+                        str(player['start_lv']) if player['start_lv'] is not None else "N/A",
+                        str(player['end_lv']) if player['end_lv'] is not None else "N/A",
+                        format_change(player['lv_change'])
+                    ])
+                elif field == "exp":
+                    row_parts.extend([
+                        format_number(player['start_exp']) if player['start_exp'] is not None else "N/A",
+                        format_number(player['end_exp']) if player['end_exp'] is not None else "N/A",
+                        format_change(player['exp_change'])
+                    ])
+                elif field == "acc":
+                    row_parts.extend([
+                        f"{player['start_acc']:.2f}%" if player['start_acc'] is not None else "N/A",
+                        f"{player['end_acc']:.2f}%" if player['end_acc'] is not None else "N/A",
+                        format_change(player['acc_change'], is_percent=True)
+                    ])
+                elif field == "combo":
+                    row_parts.extend([
+                        format_number(player['start_combo']) if player['start_combo'] is not None else "N/A",
+                        format_number(player['end_combo']) if player['end_combo'] is not None else "N/A",
+                        format_change(player['combo_change'])
+                    ])
+                elif field == "pc":
+                    row_parts.extend([
+                        format_number(player['start_pc']) if player['start_pc'] is not None else "N/A",
+                        format_number(player['end_pc']) if player['end_pc'] is not None else "N/A",
+                        format_change(player['pc_change'])
+                    ])
+            
+            print(header_format.format(*row_parts))
+        
+        print(colorize("-" * separator_width, Colors.CYAN))
+        
+        # 统计信息
+        total_players = len(trend_data)
+        stayed_players = len([p for p in trend_data if p['status'] == '='])
+        dropped_players = len([p for p in trend_data if p['status'] == '-'])
+        new_players = len([p for p in trend_data if p['status'] == '+'])
+        
+        print(colorize(f"统计: 总计 {total_players} 名玩家 | 一直在榜: {stayed_players} | 掉出榜: {dropped_players} | 新上榜: {new_players}", Colors.YELLOW))
+        
+        # 导出选项
+        export_choice = input(colorize("\n是否导出为CSV文件? (y/N): ", Colors.CYAN)).lower()
+        if export_choice == 'y':
+            self.export_trend_data(trend_data, display_fields, mode, start_crawl_time, end_crawl_time)
+    
+    def export_trend_data(self, trend_data, display_fields, mode, start_time, end_time):
+        """导出趋势数据为CSV文件"""
+        # 构建数据框
+        data_dict = {}
+        
+        # 基本字段
+        data_dict['状态'] = [player['status'] for player in trend_data]
+        data_dict['玩家名'] = [player['name'] for player in trend_data]
+        
+        # 根据选择的字段添加数据
+        if "rank" in display_fields:
+            data_dict['起始排名'] = [player['start_rank'] for player in trend_data]
+            data_dict['结束排名'] = [player['end_rank'] for player in trend_data]
+            data_dict['排名变化'] = [player['rank_change'] for player in trend_data]
+        
+        if "lv" in display_fields:
+            data_dict['起始等级'] = [player['start_lv'] for player in trend_data]
+            data_dict['结束等级'] = [player['end_lv'] for player in trend_data]
+            data_dict['等级变化'] = [player['lv_change'] for player in trend_data]
+        
+        if "exp" in display_fields:
+            data_dict['起始经验'] = [player['start_exp'] for player in trend_data]
+            data_dict['结束经验'] = [player['end_exp'] for player in trend_data]
+            data_dict['经验变化'] = [player['exp_change'] for player in trend_data]
+        
+        if "acc" in display_fields:
+            data_dict['起始准确率'] = [player['start_acc'] for player in trend_data]
+            data_dict['结束准确率'] = [player['end_acc'] for player in trend_data]
+            data_dict['准确率变化'] = [player['acc_change'] for player in trend_data]
+        
+        if "combo" in display_fields:
+            data_dict['起始连击'] = [player['start_combo'] for player in trend_data]
+            data_dict['结束连击'] = [player['end_combo'] for player in trend_data]
+            data_dict['连击变化'] = [player['combo_change'] for player in trend_data]
+        
+        if "pc" in display_fields:
+            data_dict['起始游玩次数'] = [player['start_pc'] for player in trend_data]
+            data_dict['结束游玩次数'] = [player['end_pc'] for player in trend_data]
+            data_dict['游玩次数变化'] = [player['pc_change'] for player in trend_data]
+        
+        df = pd.DataFrame(data_dict)
+        
+        # 生成文件名
+        mode_name = self.mode_names.get(mode, "未知")
+        base_filename = f"trend_mode{mode}_{start_time.strftime('%Y%m%d')}_{end_time.strftime('%Y%m%d')}.csv"
+        filename = self.get_unique_filename(base_filename, "csv")
+        filepath = os.path.join(self.output_dir, filename)
+        
+        # 保存文件
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(colorize(f"\n已导出趋势数据: {filepath}", Colors.GREEN))
     
     @db_safe_operation
     def do_alias(self, arg):
