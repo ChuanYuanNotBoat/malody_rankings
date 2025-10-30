@@ -3,3 +3,6 @@ malody_rankings.db-shm
 malody_rankings.db-wal
 viz_output/*
 __pycache__/*
+sid_progress.json
+cid_progress.json
+logs/*

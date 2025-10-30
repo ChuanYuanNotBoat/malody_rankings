@@ -51,8 +51,8 @@ logger.addHandler(console_handler)
 
 # 替换为你自己的 Cookie 信息
 COOKIES = {
-    "sessionid": "--",
-    "csrftoken": "--"
+    "sessionid": "ufaq36f8cref9gn73v4r3qjjiprngu2b",
+    "csrftoken": "7XOJDuypZB9ACYJqVhTHA2t2BksYSehe"
 }
 
 HEADERS = {
