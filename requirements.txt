@@ -8,6 +8,7 @@ beautifulsoup4>=4.12.3
 
 # 数据处理库
 pandas>=2.2.2
+numpy>=1.24.0
 
 # Excel 文件处理
 openpyxl>=3.1.2
@@ -21,3 +22,12 @@ cryptography>=42.0.8
 
 # 重试机制
 urllib3>=2.2.1
+
+# 数据可视化
+matplotlib>=3.7.0
+
+# 命令行界面
+cmd2>=2.4.0
+
+# 数据库
+sqlite3  # 通常为Python内置，但确保版本兼容性

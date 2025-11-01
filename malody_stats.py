@@ -18,6 +18,51 @@ import shutil
 import re
 import math
 
+# 修复matplotlib中文字体问题
+def setup_chinese_font():
+    """设置中文字体支持"""
+    try:
+        import matplotlib.font_manager as fm
+        import platform
+        
+        # 获取系统中所有字体
+        fonts = fm.findSystemFonts()
+        chinese_fonts = []
+        
+        # 常见中文字体列表
+        common_chinese_fonts = [
+            'SimHei', 'Microsoft YaHei', 'SimSun', 'KaiTi', 'FangSong',
+            'STSong', 'STKaiti', 'STFangsong', 'STHeiti', 'PingFang SC',
+            'Hiragino Sans GB', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC'
+        ]
+        
+        # 查找可用的中文字体
+        for font_path in fonts:
+            try:
+                font = fm.FontProperties(fname=font_path)
+                font_name = font.get_name()
+                if any(ch_font in font_name for ch_font in common_chinese_fonts):
+                    chinese_fonts.append(font_path)
+            except:
+                continue
+        
+        if chinese_fonts:
+            # 使用找到的第一个中文字体
+            plt.rcParams['font.sans-serif'] = [fm.FontProperties(fname=chinese_fonts[0]).get_name()] + plt.rcParams['font.sans-serif']
+            plt.rcParams['axes.unicode_minus'] = False
+            print(f"已设置中文字体: {fm.FontProperties(fname=chinese_fonts[0]).get_name()}")
+            return True
+        else:
+            print("警告: 未找到中文字体，图表中的中文可能显示为方块")
+            return False
+            
+    except Exception as e:
+        print(f"字体设置错误: {e}")
+        return False
+
+# 在程序初始化时调用字体设置
+setup_chinese_font()
+
 
 # PowerShell 颜色支持修复
 def enable_powershell_colors():
@@ -65,13 +110,6 @@ sqlite3.register_converter("timestamp", convert_datetime)
 
 # 设置matplotlib使用Agg后端（无GUI）
 plt.switch_backend('Agg')
-
-# 设置matplotlib支持中文显示
-try:
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial']
-    plt.rcParams['axes.unicode_minus'] = False
-except:
-    print("警告: 无法设置中文字体，图表中的中文可能显示为方块")
 
 # 设置图表字体颜色为深色，避免与背景冲突
 plt.rcParams['text.color'] = 'black'
