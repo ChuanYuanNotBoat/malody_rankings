@@ -2180,6 +2180,14 @@ class MalodyViz(cmd.Cmd):
     def do_stb_stats(self, arg):
         """
         谱面基础统计（支持选择器筛选）
+        
+        用法: stb_stats [模式]
+        参数:
+        模式 - 可选，模式编号，默认为当前模式
+        
+        示例:
+        stb_stats      # 当前模式统计
+        stb_stats 0    # 模式0统计
         """
         args = arg.split()
         mode = self.current_mode
@@ -2195,19 +2203,26 @@ class MalodyViz(cmd.Cmd):
         # 使用选择器构建谱面查询条件
         where_clause, params = self.selector.build_chart_sql_where("c")
         
-        # 如果选择器中没有指定模式，使用当前模式
+        # 如果选择器中没有指定模式，且当前模式不是所有模式，使用当前模式
         if not self.selector.filters['modes'] and self.selector.current_mode != -1:
             where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
             params.append(mode)
         
         stats = self._get_chart_stats(cursor, where_clause, params)
-        self._display_chart_stats(stats, mode)
-
-    def _display_chart_stats(self, stats, mode):
-        """显示谱面统计信息"""
-        mode_name = self.mode_names.get(mode, "未知")
         
-        print(colorize(f"\n谱面统计 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        # 显示模式信息
+        if self.selector.filters['modes']:
+            mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
+        elif self.selector.current_mode != -1:
+            mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
+        else:
+            mode_str = "所有模式"
+        
+        self._display_chart_stats(stats, mode_str)
+
+    def _display_chart_stats(self, stats, mode_str):
+        """显示谱面统计信息"""
+        print(colorize(f"\n谱面统计 - 模式 {mode_str}", Colors.CYAN))
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
@@ -2453,7 +2468,7 @@ class MalodyViz(cmd.Cmd):
             where_clause += " AND c.last_updated >= ?" if where_clause != "1=1" else "c.last_updated >= ?"
             params.append(start_date)
         
-        # 如果选择器中没有指定模式，使用当前模式
+        # 如果选择器中没有指定模式，且当前模式不是所有模式，使用当前模式
         if not self.selector.filters['modes'] and self.selector.current_mode != -1:
             where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
             params.append(mode)
@@ -2476,8 +2491,16 @@ class MalodyViz(cmd.Cmd):
             print(colorize(f"\n没有找到符合条件的谱面", Colors.YELLOW))
             return
         
-        mode_name = self.mode_names.get(mode, "未知")
+        # 显示模式信息
+        if self.selector.filters['modes']:
+            mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
+        elif self.selector.current_mode != -1:
+            mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
+        else:
+            mode_str = "所有模式"
+        
         print(colorize(f"\n最近更新的谱面", Colors.CYAN))
+        print(colorize(f"模式: {mode_str}", Colors.YELLOW))
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
@@ -2494,18 +2517,18 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation  
     def do_stb_hot(self, arg):
         """
-        显示热门谱面排行榜
+        显示热门谱面排行榜（支持选择器筛选）
         
         用法: stb_hot [模式] [排序字段] [数量]
         参数:
-          模式     - 可选，模式编号，默认为当前模式
-          排序字段 - 可选，heat(热度), donate_count(打赏数), 默认为heat
-          数量     - 可选，要显示的谱面数量，默认为10
+        模式     - 可选，模式编号，默认为当前模式
+        排序字段 - 可选，heat(热度), donate_count(打赏数), 默认为heat
+        数量     - 可选，要显示的谱面数量，默认为10
         
         示例:
-          stb_hot           # 当前模式按热度前10
-          stb_hot 0         # 模式0按热度前10  
-          stb_hot 0 donate_count 5   # 模式0按打赏数前5
+        stb_hot           # 当前模式按热度前10
+        stb_hot 0         # 模式0按热度前10  
+        stb_hot 0 donate_count 5   # 模式0按打赏数前5
         """
         args = arg.split()
         mode = self.current_mode
@@ -2538,28 +2561,44 @@ class MalodyViz(cmd.Cmd):
         
         cursor = self.conn.cursor()
         
-        cursor.execute(
-            f"""
-            SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-                   c.creator_name, c.heat, c.donate_count, c.last_updated
-            FROM charts c
-            JOIN songs s ON c.sid = s.sid
-            WHERE c.mode = ?
-            ORDER BY c.{sort_field} DESC
-            LIMIT ?
-            """,
-            (mode, limit)
-        )
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
         
+        # 如果选择器中没有指定模式，且当前模式不是所有模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        query = f"""
+        SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
+            c.creator_name, c.heat, c.donate_count, c.last_updated
+        FROM charts c
+        JOIN songs s ON c.sid = s.sid
+        WHERE {where_clause}
+        ORDER BY c.{sort_field} DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        
+        cursor.execute(query, params)
         results = cursor.fetchall()
         
         if not results:
-            print(colorize(f"\n模式 {mode} 没有谱面数据", Colors.YELLOW))
+            print(colorize(f"\n没有找到符合条件的谱面", Colors.YELLOW))
             return
         
-        mode_name = self.mode_names.get(mode, "未知")
+        # 显示模式信息
+        if self.selector.filters['modes']:
+            mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
+        elif self.selector.current_mode != -1:
+            mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
+        else:
+            mode_str = "所有模式"
+        
         field_name = "热度" if sort_field == "heat" else "打赏数"
-        print(colorize(f"\n热门谱面排行榜 ({field_name}) - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"\n热门谱面排行榜 ({field_name})", Colors.CYAN))
+        print(colorize(f"模式: {mode_str}", Colors.YELLOW))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         for i, (cid, version, level, status, title, artist, creator, heat, donate, updated) in enumerate(results, 1):
