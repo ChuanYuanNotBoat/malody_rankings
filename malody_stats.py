@@ -17,6 +17,7 @@ from functools import wraps
 import shutil
 import re
 import math
+from selector import global_selector, MCSelector
 
 # 修复matplotlib中文字体问题
 def setup_chinese_font():
@@ -259,7 +260,7 @@ class MalodyViz(cmd.Cmd):
         super().__init__()
         self.db_path = "malody_rankings.db"
         self.conn = None
-        self.current_mode = 0
+        self.current_mode = -1  # -1 表示所有模式
         self.output_dir = "viz_output"
         
         atexit.register(self.cleanup)
@@ -271,14 +272,19 @@ class MalodyViz(cmd.Cmd):
         
         self.connect_db()
         
+        # 初始化选择器
+        self.selector = global_selector
+        self.selector.current_mode = self.current_mode
+        
         self.mode_names = {
+            -1: "All",  # 所有模式
             0: "Key",
-            1: "Step",
+            1: "Step", 
             2: "DJ",
             3: "Catch",
             4: "Pad",
             5: "Taiko",
-            6: "Ring",
+            6: "Ring", 
             7: "Slide",
             8: "Live",
             9: "Cube"
@@ -343,15 +349,20 @@ class MalodyViz(cmd.Cmd):
             print(get_separator())
             
             commands = [
+                # 基础命令
                 ("ls [路径]", "列出目录内容"),
-                ("mode [模式]", "设置或查看当前模式"),
+                ("mode [模式|*]", "设置或查看当前模式（*表示所有模式）"),
+                ("select <选择器>", "设置筛选条件（类似MC选择器）"),
+                
+                # 玩家相关命令（支持玩家、时间、模式筛选）
                 ("top [数量]", "显示顶级玩家排名"),
                 ("player <玩家名> [模式]", "查看玩家信息"),
                 ("history <玩家名> [模式] [天数]", "查看玩家历史排名并生成图表"),
                 ("compare <玩家1> <玩家2> [...] [模式] [天数]", "比较多个玩家的排名变化"),
-                ("top_chart [数量] [模式]", "生成顶级玩家分布图表"),
                 ("trend <起始日期> [模式] [显示项]", "统计玩家数据变化趋势"),
                 ("search <关键词> [类型] [模式]", "搜索玩家/谱面/创作者"),
+                
+                # 谱面相关命令（支持难度、时间、模式筛选）
                 ("stb_stats [模式]", "谱面基础统计"),
                 ("stb_summary [模式] [级别]", "谱面综合统计报告"),
                 ("stb_hot [模式] [排序] [数量]", "热门谱面排行榜"),
@@ -360,6 +371,8 @@ class MalodyViz(cmd.Cmd):
                 ("stb_quality [模式]", "检查数据质量"),
                 ("stb_trends [模式] [周期]", "分析谱面数据趋势"),
                 ("stb_compare [模式列表]", "比较不同模式的谱面数据"),
+                
+                # 其他命令
                 ("alias <原名> <新名>", "设置玩家别名"),
                 ("export <类型> [模式] [天数]", "导出数据为CSV文件"),
                 ("update", "更新数据（调用爬虫脚本）"),
@@ -369,6 +382,18 @@ class MalodyViz(cmd.Cmd):
             
             for cmd, desc in commands:
                 print(f"  {colorize(cmd, Colors.GREEN):<35} {desc}")
+            print(colorize("\n选择器格式说明:", Colors.CYAN))
+            print(get_subseparator())
+            print("  @p[玩家1,玩家2]    - 选择玩家（支持名称或UID）")
+            print("  @d[难度范围]      - 选择难度（如 5, 5-10）")
+            print("  @t[时间范围]      - 选择时间（如 7d, 30d）") 
+            print("  @m[模式列表]      - 选择模式（如 0,3,5）")
+            print("  @*                - 选择所有（清除筛选）")
+            
+            print(colorize("\n命令筛选支持:", Colors.CYAN))
+            print(get_subseparator())
+            print("  玩家命令: 支持玩家、时间、模式筛选")
+            print("  谱面命令: 支持难度、时间、模式筛选")
             
             print(colorize("\n模式编号对应表:", Colors.CYAN))
             print(get_subseparator())
@@ -376,7 +401,59 @@ class MalodyViz(cmd.Cmd):
                 print(f"  {mode_id}: {mode_name}")
             
             print(colorize("\n输入 'help <命令名>' 查看具体命令的详细说明", Colors.YELLOW))
-    
+
+    def do_select(self, arg):
+        """
+        设置筛选条件（类似MC选择器）
+        
+        用法: select <选择器>
+        选择器格式:
+        @p[玩家1,玩家2,...]    - 选择玩家（支持名称或UID）
+        @d[难度范围]          - 选择难度（如 5, 5-10）
+        @t[时间范围]          - 选择时间（如 7d, 30d, 2024-01-01）
+        @m[模式列表]          - 选择模式（如 0,3,5）
+        @*                   - 选择所有（清除筛选）
+        
+        示例:
+        select @p[Zani]              # 选择玩家Zani
+        select @d[5-10]              # 选择难度5-10
+        select @t[7d]                # 选择最近7天
+        select @m[0,3]               # 选择模式0和3
+        select @p[Zani] @d[5-10]     # 组合筛选
+        select @*                    # 清除所有筛选
+        """
+        if not arg:
+            print(colorize("\n当前筛选条件:", Colors.CYAN))
+            print(get_separator())
+            print(self.selector.get_current_selection())
+            return
+        
+        if arg.strip() == "@*":
+            self.selector.clear_filters()
+            print(colorize("已清除所有筛选条件", Colors.GREEN))
+            return
+        
+        # 解析选择器
+        filters = self.selector.parse_selector(arg)
+        
+        # 应用筛选条件
+        if 'players' in filters:
+            self.selector.set_filters(players=filters['players'])
+        if 'difficulties' in filters:
+            self.selector.set_filters(difficulties=filters['difficulties'])
+        if 'time_range' in filters:
+            self.selector.set_filters(time_range=filters['time_range'])
+        if 'modes' in filters:
+            self.selector.set_filters(modes=filters['modes'])
+            # 如果选择了具体模式，更新当前模式为第一个模式
+            if filters['modes']:
+                self.current_mode = filters['modes'][0]
+        
+        print(colorize("\n已应用筛选条件:", Colors.GREEN))
+        print(get_separator())
+        print(self.selector.get_current_selection())
+
+
     @db_safe_operation
     def do_ls(self, arg):
         """
@@ -410,45 +487,55 @@ class MalodyViz(cmd.Cmd):
     
     def do_mode(self, arg):
         """
-        设置或查看当前模式
+        设置或查看当前模式（支持*表示所有模式）
         
-        用法: mode [模式编号]
+        用法: mode [模式编号|*]
         参数:
-          模式编号 - 0到9之间的数字，表示不同的游戏模式
+        模式编号 - 0到9之间的数字，表示不同的游戏模式，*表示所有模式
         
         示例:
-          mode     # 查看当前模式
-          mode 0   # 切换到Key模式
-          mode 3   # 切换到Catch模式
+        mode     # 查看当前模式
+        mode 0   # 切换到Key模式  
+        mode *   # 切换到所有模式
         """
         if not arg:
             mode_name = self.mode_names.get(self.current_mode, "未知")
             print(colorize(f"\n当前模式: {self.current_mode} ({mode_name})", Colors.CYAN))
+            print(colorize(f"当前筛选: {self.selector.get_current_selection()}", Colors.YELLOW))
+            return
+        
+        if arg == '*':
+            self.current_mode = -1
+            self.selector.current_mode = -1
+            self.selector.set_filters(modes=[])  # 清除模式筛选
+            print(colorize("\n已切换到所有模式", Colors.GREEN))
             return
         
         try:
             mode = int(arg)
-            if mode not in self.mode_names:
-                print(colorize("错误: 模式必须在0-9之间", Colors.RED))
+            if mode not in self.mode_names or mode == -1:
+                print(colorize("错误: 模式必须在0-9之间，或使用*表示所有模式", Colors.RED))
                 return
             self.current_mode = mode
+            self.selector.current_mode = mode
+            self.selector.set_filters(modes=[mode])  # 设置模式筛选
             mode_name = self.mode_names.get(mode, "未知")
             print(colorize(f"\n已切换到模式: {mode} ({mode_name})", Colors.GREEN))
         except ValueError:
-            print(colorize("错误: 请输入有效的模式数字(0-9)", Colors.RED))
-    
+            print(colorize("错误: 请输入有效的模式数字(0-9)或*", Colors.RED))
+
     @db_safe_operation
     def do_top(self, arg):
         """
-        查看当前模式的顶级玩家
+        查看顶级玩家排名（支持玩家和时间筛选，不支持难度筛选）
         
         用法: top [数量]
         参数:
-          数量 - 可选，要显示的玩家数量，默认为10
+        数量 - 可选，要显示的玩家数量，默认为10
         
         示例:
-          top      # 显示前10名玩家
-          top 20   # 显示前20名玩家
+        top        # 显示前10名玩家
+        top 20     # 显示前20名玩家
         """
         try:
             limit = int(arg) if arg else 10
@@ -460,33 +547,54 @@ class MalodyViz(cmd.Cmd):
             return
         
         cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
-            (self.current_mode,)
-        )
+        
+        # 使用选择器构建玩家查询条件（忽略难度筛选）
+        where_clause, params = self.selector.build_player_sql_where("pr")
+        
+        # 获取最新爬取时间
+        if self.selector.filters['modes']:
+            mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(self.selector.filters['modes'])))
+            cursor.execute(
+                f"SELECT MAX(crawl_time) FROM player_rankings pr WHERE {mode_condition}",
+                self.selector.filters['modes']
+            )
+        elif self.selector.current_mode != -1:
+            cursor.execute(
+                "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
+                (self.selector.current_mode,)
+            )
+        else:
+            cursor.execute("SELECT MAX(crawl_time) FROM player_rankings")
+        
         latest_time = cursor.fetchone()[0]
         
         if not latest_time:
-            print(colorize(f"\n模式 {self.current_mode} 没有数据", Colors.YELLOW))
+            print(colorize("没有找到数据", Colors.YELLOW))
             return
         
-        cursor.execute(
-            """
-            SELECT pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
-            FROM player_rankings pr
-            WHERE pr.mode = ? AND pr.crawl_time = ?
-            ORDER BY pr.rank
-            LIMIT ?
-            """,
-            (self.current_mode, latest_time, limit)
-        )
+        # 添加时间条件（如果没有设置时间筛选）
+        if not self.selector.filters['time_range']:
+            if "crawl_time" not in where_clause:
+                where_clause += " AND pr.crawl_time = ?"
+                params.append(latest_time)
         
+        query = f"""
+        SELECT pr.mode, pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
+        FROM player_rankings pr
+        WHERE {where_clause}
+        ORDER BY pr.mode, pr.rank
+        LIMIT ?
+        """
+        params.append(limit)
+        
+        cursor.execute(query, params)
         players = cursor.fetchall()
         
         if not players:
-            print(colorize(f"\n模式 {self.current_mode} 没有找到玩家数据", Colors.YELLOW))
+            print(colorize("没有找到符合条件的玩家", Colors.YELLOW))
             return
         
+        # 显示结果
         terminal_width = get_terminal_width()
         
         if terminal_width < 100:
@@ -494,18 +602,34 @@ class MalodyViz(cmd.Cmd):
             header_format = "{:<6} {:<15} {:<6} {:<8} {:<8} {:<6} {:<8}"
             row_format = "{:<6} {:<15} {:<6} {:<8} {:<8.2f} {:<6} {:<8}"
         else:
-            col_widths = [6, 20, 6, 10, 8, 6, 8]
-            header_format = "{:<6} {:<20} {:<6} {:<10} {:<8} {:<6} {:<8}"
-            row_format = "{:<6} {:<20} {:<6} {:<10} {:<8.2f} {:<6} {:<8}"
+            col_widths = [8, 6, 20, 6, 10, 8, 6, 8]
+            header_format = "{:<8} {:<6} {:<20} {:<6} {:<10} {:<8} {:<6} {:<8}"
+            row_format = "{:<8} {:<6} {:<20} {:<6} {:<10} {:<8.2f} {:<6} {:<8}"
         
-        mode_name = self.mode_names.get(self.current_mode, "未知")
-        print(colorize(f"\n模式 {self.current_mode} ({mode_name}) 顶级玩家排名", Colors.CYAN))
-        print(colorize(f"数据时间: {latest_time}", Colors.YELLOW))
-        print(get_separator())
-        print(colorize(header_format.format("排名", "玩家名", "等级", "经验", "准确率", "连击", "游玩次数"), Colors.BOLD))
+        print(colorize(f"\n顶级玩家排名", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+        if not self.selector.filters['time_range']:
+            print(colorize(f"数据时间: {latest_time}", Colors.YELLOW))
         print(get_separator())
         
-        for rank, name, lv, exp, acc, combo, pc in players:
+        if terminal_width >= 100:
+            print(colorize(header_format.format("模式", "排名", "玩家名", "等级", "经验", "准确率", "连击", "游玩次数"), Colors.BOLD))
+        else:
+            print(colorize(header_format.format("排名", "玩家名", "等级", "经验", "准确率", "连击", "游玩次数"), Colors.BOLD))
+        
+        print(get_separator())
+        
+        current_mode = None
+        for player in players:
+            if terminal_width >= 100:
+                mode, rank, name, lv, exp, acc, combo, pc = player
+                if mode != current_mode:
+                    mode_name = self.mode_names.get(mode, "未知")
+                    print(colorize(f"\n模式 {mode} ({mode_name}):", Colors.CYAN))
+                    current_mode = mode
+            else:
+                rank, name, lv, exp, acc, combo, pc = player[1:]  # 跳过模式列
+            
             if rank == 1:
                 rank_str = colorize(f"{rank}", Colors.YELLOW)
             elif rank == 2:
@@ -515,39 +639,47 @@ class MalodyViz(cmd.Cmd):
             else:
                 rank_str = str(rank)
             
-            if len(name) > col_widths[1]:
-                name = name[:col_widths[1]-3] + "..."
-                
-            print(row_format.format(
-                rank_str, name, lv, exp, acc, combo, pc
-            ))
+            if len(name) > (20 if terminal_width >= 100 else 15):
+                name = name[:(17 if terminal_width >= 100 else 12)] + "..."
+            
+            if terminal_width >= 100:
+                print(row_format.format(
+                    f"{mode}", rank_str, name, lv, exp, acc, combo, pc
+                ))
+            else:
+                print(row_format.format(
+                    rank_str, name, lv, exp, acc, combo, pc
+                ))
     
     @db_safe_operation
     def do_player(self, arg):
         """
-        查看玩家信息（支持玩家名或UID）
+        查看玩家信息（支持选择器筛选，参数优先）
         
         用法: player <玩家名或UID> [模式]
         参数:
-          玩家名或UID - 要查询的玩家名称或UID
-          模式       - 可选，模式编号，默认为当前模式
+        玩家名或UID - 要查询的玩家名称或UID（优先于选择器）
+        模式       - 可选，模式编号，默认为当前模式（优先于选择器）
         
         示例:
-          player Zani      # 查看玩家Zani在当前模式的信息
-          player 123456    # 查看UID为123456的玩家
-          player Zani 0    # 查看Zani在模式0的信息
+        player Zani      # 查看玩家Zani在当前模式的信息（忽略选择器中的玩家筛选）
+        player 123456    # 查看UID为123456的玩家
+        player Zani 0    # 查看Zani在模式0的信息（忽略选择器中的模式筛选）
         """
         args = arg.split()
         if not args:
             print(colorize("错误: 请输入玩家名或UID", Colors.RED))
             return
         
+        # 参数中的玩家标识符优先于选择器
         identifier = args[0]
         mode = self.current_mode
+        
+        # 参数中的模式优先于选择器
         if len(args) > 1:
             try:
                 mode = int(args[1])
-                if mode not in self.mode_names:
+                if mode not in self.mode_names or mode == -1:
                     print(colorize("错误: 模式必须在0-9之间", Colors.RED))
                     return
             except ValueError:
@@ -578,15 +710,39 @@ class MalodyViz(cmd.Cmd):
         
         player_id = result[0]
         
+        # 构建查询条件 - 使用参数中的模式，但应用选择器的其他筛选
+        where_conditions = ["pr.player_id = ?", "pr.mode = ?"]
+        query_params = [player_id, mode]
+        
+        # 应用选择器的时间筛选（如果有）
+        if self.selector.filters['time_range']:
+            where_conditions.append("pr.crawl_time BETWEEN ? AND ?")
+            query_params.extend([
+                self.selector.filters['time_range']['start'],
+                self.selector.filters['time_range']['end']
+            ])
+        else:
+            # 如果没有时间筛选，获取最新数据
+            cursor.execute(
+                "SELECT MAX(crawl_time) FROM player_rankings WHERE player_id = ? AND mode = ?",
+                (player_id, mode)
+            )
+            latest_time = cursor.fetchone()[0]
+            if latest_time:
+                where_conditions.append("pr.crawl_time = ?")
+                query_params.append(latest_time)
+        
+        where_clause = " AND ".join(where_conditions)
+        
         cursor.execute(
-            """
+            f"""
             SELECT pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time
             FROM player_rankings pr
-            WHERE pr.player_id = ? AND pr.mode = ?
+            WHERE {where_clause}
             ORDER BY pr.crawl_time DESC
             LIMIT 1
             """,
-            (player_id, mode)
+            query_params
         )
         
         player_data = cursor.fetchone()
@@ -595,15 +751,12 @@ class MalodyViz(cmd.Cmd):
             mode_name = self.mode_names.get(mode, "未知")
             print(colorize(f"\n玩家 {identifier} 在模式 {mode} ({mode_name}) 中没有数据", Colors.YELLOW))
             return
-            
-        if len(player_data) < 7:
-            print(colorize(f"\n玩家 {identifier} 的数据不完整", Colors.YELLOW))
-            return
-            
+                
         rank, lv, exp, acc, combo, pc, crawl_time = player_data
-        
+            
         mode_name = self.mode_names.get(mode, "未知")
         print(colorize(f"\n玩家: {identifier} (模式 {mode} - {mode_name})", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(colorize(f"数据时间: {crawl_time}", Colors.YELLOW))
         print(get_separator())
         print(f"排名: {colorize(rank, Colors.GREEN)}")
@@ -625,37 +778,40 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_history(self, arg):
         """
-        查看玩家历史排名并生成图表
+        查看玩家历史排名并生成图表（参数优先）
         
         用法: history <玩家名> [模式] [天数]
         参数:
-          玩家名 - 要查询的玩家名称
-          模式   - 可选，模式编号，默认为当前模式
-          天数   - 可选，要查询的历史天数，默认为30天
+        玩家名 - 要查询的玩家名称（优先于选择器）
+        模式   - 可选，模式编号，默认为当前模式（优先于选择器）
+        天数   - 可选，要查询的历史天数，默认为30天（优先于选择器）
         
         示例:
-          history Zani        # 查看Zani在当前模式最近30天的历史
-          history Zani 0 60   # 查看Zani在模式0最近60天的历史
+        history Zani        # 查看Zani在当前模式最近30天的历史（忽略选择器）
+        history Zani 0 60   # 查看Zani在模式0最近60天的历史（忽略选择器）
         """
         args = arg.split()
         if not args:
             print(colorize("错误: 请输入玩家名", Colors.RED))
             return
         
+        # 参数中的玩家名优先于选择器
         player_name = args[0]
         mode = self.current_mode
         days = 30
         
+        # 参数中的模式优先于选择器
         if len(args) > 1:
             try:
                 mode = int(args[1])
-                if mode not in self.mode_names:
+                if mode not in self.mode_names or mode == -1:
                     print(colorize("错误: 模式必须在0-9之间", Colors.RED))
                     return
             except ValueError:
                 print(colorize("错误: 请输入有效的模式数字(0-9)", Colors.RED))
                 return
         
+        # 参数中的天数优先于选择器
         if len(args) > 2:
             try:
                 days = int(args[2])
@@ -680,17 +836,24 @@ class MalodyViz(cmd.Cmd):
         
         player_id = result[0]
         
+        # 使用参数中的天数，忽略选择器的时间筛选
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
+        # 构建查询条件
+        where_conditions = ["pr.player_id = ?", "pr.mode = ?", "pr.crawl_time >= ?"]
+        query_params = [player_id, mode, start_date]
+        
+        where_clause = " AND ".join(where_conditions)
+        
         cursor.execute(
-            """
+            f"""
             SELECT pr.rank, pr.crawl_time
             FROM player_rankings pr
-            WHERE pr.player_id = ? AND pr.mode = ? AND pr.crawl_time >= ?
+            WHERE {where_clause}
             ORDER BY pr.crawl_time
             """,
-            (player_id, mode, start_date)
+            query_params
         )
         
         history_data = cursor.fetchall()
@@ -739,17 +902,17 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_compare(self, arg):
         """
-        比较多个玩家的排名变化
+        比较多个玩家的排名变化（参数优先）
         
         用法: compare <玩家1> <玩家2> [更多玩家...] [模式] [天数]
         参数:
-          玩家1, 玩家2... - 要比较的玩家名称
-          模式            - 可选，模式编号，默认为当前模式
-          天数            - 可选，要查询的历史天数，默认为30天
+        玩家1, 玩家2... - 要比较的玩家名称（优先于选择器）
+        模式            - 可选，模式编号，默认为当前模式（优先于选择器）
+        天数            - 可选，要查询的历史天数，默认为30天（优先于选择器）
         
         示例:
-          compare Zani N0tYour1dol           # 比较两名玩家在当前模式最近30天的排名
-          compare Zani N0tYour1dol -KIRITAN- 0 60  # 比较三名玩家在模式0最近60天的排名
+        compare Zani N0tYour1dol           # 比较两名玩家在当前模式最近30天的排名
+        compare Zani N0tYour1dol -KIRITAN- 0 60  # 比较三名玩家在模式0最近60天的排名
         """
         args = arg.split()
         if len(args) < 2:
@@ -761,8 +924,9 @@ class MalodyViz(cmd.Cmd):
         days = 30
         i = 0
         
+        # 解析参数中的玩家列表（优先于选择器）
         while i < len(args):
-            if args[i].isdigit() and int(args[i]) in self.mode_names:
+            if args[i].isdigit() and int(args[i]) in self.mode_names and int(args[i]) != -1:
                 mode = int(args[i])
                 i += 1
                 break
@@ -783,6 +947,7 @@ class MalodyViz(cmd.Cmd):
         
         cursor = self.conn.cursor()
         
+        # 使用参数中的天数，忽略选择器的时间筛选
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         
@@ -802,14 +967,20 @@ class MalodyViz(cmd.Cmd):
             
             player_id = result[0]
             
+            # 构建查询条件
+            where_conditions = ["pr.player_id = ?", "pr.mode = ?", "pr.crawl_time >= ?"]
+            query_params = [player_id, mode, start_date]
+            
+            where_clause = " AND ".join(where_conditions)
+            
             cursor.execute(
-                """
+                f"""
                 SELECT pr.rank, pr.crawl_time
                 FROM player_rankings pr
-                WHERE pr.player_id = ? AND pr.mode = ? AND pr.crawl_time >= ?
+                WHERE {where_clause}
                 ORDER BY pr.crawl_time
                 """,
-                (player_id, mode, start_date)
+                query_params
             )
             
             history_data = cursor.fetchall()
@@ -823,7 +994,7 @@ class MalodyViz(cmd.Cmd):
             ranks = [row[0] for row in history_data]
             
             ax.plot(dates, ranks, 'o-', linewidth=2, markersize=4, 
-                   color=colors[idx], label=player_name)
+                color=colors[idx], label=player_name)
         
         ax.invert_yaxis()
         mode_name = self.mode_names.get(mode, "未知")
@@ -1135,25 +1306,25 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_trend(self, arg):
         """
-        统计玩家数据变化趋势
+        统计玩家数据变化趋势（参数优先）
         
         用法: trend <起始日期> [模式] [显示项]
         参数:
-          起始日期 - 格式为YYYY-MM-DD，统计从该日期开始的变化
-          模式     - 可选，模式编号，默认为当前模式
-          显示项   - 可选，要显示的统计项，用逗号分隔，如: rank,lv,exp,acc,combo,pc
+        起始日期 - 格式为YYYY-MM-DD，统计从该日期开始的变化（优先于选择器）
+        模式     - 可选，模式编号，默认为当前模式（优先于选择器）
+        显示项   - 可选，要显示的统计项，用逗号分隔，如: rank,lv,exp,acc,combo,pc
         
         示例:
-          trend 2024-01-01                    # 统计从2024年1月1日开始的玩家数据变化
-          trend 2024-01-01 0                  # 统计模式0从2024年1月1日开始的玩家数据变化
-          trend 2024-01-01 0 rank,exp,acc     # 只显示排名、经验和准确率的变化
+        trend 2024-01-01                    # 统计从2024年1月1日开始的玩家数据变化
+        trend 2024-01-01 0                  # 统计模式0从2024年1月1日开始的玩家数据变化
+        trend 2024-01-01 0 rank,exp,acc     # 只显示排名、经验和准确率的变化
         """
         args = arg.split()
         if not args:
             print(colorize("错误: 请输入起始日期", Colors.RED))
             return
         
-        # 解析起始日期
+        # 解析起始日期（优先于选择器）
         try:
             start_date = datetime.strptime(args[0], "%Y-%m-%d")
         except ValueError:
@@ -1164,8 +1335,8 @@ class MalodyViz(cmd.Cmd):
         display_fields = ["rank", "lv", "exp", "acc", "combo", "pc"]  # 默认显示所有项
         
         if len(args) > 1:
-            # 检查第二个参数是否为模式
-            if args[1].isdigit() and int(args[1]) in self.mode_names:
+            # 检查第二个参数是否为模式（优先于选择器）
+            if args[1].isdigit() and int(args[1]) in self.mode_names and int(args[1]) != -1:
                 mode = int(args[1])
                 # 检查是否有显示项参数
                 if len(args) > 2:
@@ -1387,6 +1558,7 @@ class MalodyViz(cmd.Cmd):
         # 显示结果
         mode_name = self.mode_names.get(mode, "未知")
         print(colorize(f"\n玩家数据变化趋势 (模式 {mode} - {mode_name})", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(colorize(f"时间范围: {start_crawl_time} 到 {end_crawl_time}", Colors.YELLOW))
         
         separator_width = get_terminal_width()
@@ -1511,7 +1683,7 @@ class MalodyViz(cmd.Cmd):
         export_choice = input(colorize("\n是否导出为CSV文件? (y/N): ", Colors.CYAN)).lower()
         if export_choice == 'y':
             self.export_trend_data(trend_data, display_fields, mode, start_crawl_time, end_crawl_time)
-    
+            
     def export_trend_data(self, trend_data, display_fields, mode, start_time, end_time):
         """导出趋势数据为CSV文件"""
         # 构建数据框
@@ -1567,19 +1739,19 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_search(self, arg):
         """
-        通用搜索功能
+        通用搜索功能（支持选择器筛选）
         
         用法: search <关键词> [类型] [模式]
         参数:
-          关键词 - 要搜索的内容
-          类型   - player(玩家), chart(谱面), creator(创作者), 默认为player
-          模式   - 可选，模式编号
+        关键词 - 要搜索的内容
+        类型   - player(玩家), chart(谱面), creator(创作者), 默认为player
+        模式   - 可选，模式编号
         
         示例:
-          search Zani                    # 搜索玩家Zani
-          search "song title" chart      # 搜索谱面
-          search creator_name creator    # 搜索创作者
-          search 123456 player           # 搜索UID为123456的玩家
+        search Zani                    # 搜索玩家Zani
+        search "song title" chart      # 搜索谱面
+        search creator_name creator    # 搜索创作者
+        search 123456 player           # 搜索UID为123456的玩家
         """
         args = arg.split()
         if not args:
@@ -1610,7 +1782,131 @@ class MalodyViz(cmd.Cmd):
             self._search_creators(cursor, keyword, mode)
         else:
             print(colorize(f"错误: 不支持的搜索类型 '{search_type}'", Colors.RED))
-    
+
+    def _search_players(self, cursor, keyword, mode):
+        """搜索玩家（支持名称和UID）"""
+        # 使用选择器构建玩家查询条件
+        where_clause, params = self.selector.build_player_sql_where("pr")
+        
+        if keyword.isdigit():
+            # UID搜索
+            cursor.execute(
+                f"SELECT pi.player_id, pi.current_name, pi.uid FROM player_identity pi WHERE pi.uid = ?", 
+                (keyword,)
+            )
+            result = cursor.fetchone()
+            if result:
+                player_id, name, uid = result
+                # 应用选择器筛选查询玩家数据
+                player_where, player_params = self.selector.build_player_sql_where("pr")
+                player_where += " AND pr.player_id = ?"
+                player_params.append(player_id)
+                
+                cursor.execute(
+                    f"""
+                    SELECT pr.rank, pr.lv, pr.acc, pr.combo, pr.pc, pr.crawl_time
+                    FROM player_rankings pr
+                    WHERE {player_where}
+                    ORDER BY pr.crawl_time DESC LIMIT 1
+                    """,
+                    player_params
+                )
+                player_data = cursor.fetchone()
+                if player_data:
+                    rank, lv, acc, combo, pc, crawl_time = player_data
+                    print(colorize(f"\n玩家: {name} (UID: {uid})", Colors.CYAN))
+                    print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+                    print(get_separator())
+                    print(f"排名: {rank}, 等级: {lv}, 准确率: {acc:.2f}%")
+                    print(f"连击: {combo}, 游玩次数: {pc}")
+                    return
+            
+            print(colorize(f"未找到UID为 {keyword} 的玩家", Colors.YELLOW))
+        else:
+            # 名称搜索 - 应用选择器筛选
+            where_clause += " AND pr.name LIKE ?"
+            params.append(f'%{keyword}%')
+            
+            cursor.execute(
+                f"""
+                SELECT DISTINCT pr.name, pr.rank, pr.lv, pr.acc, pr.crawl_time
+                FROM player_rankings pr
+                WHERE {where_clause}
+                ORDER BY pr.rank LIMIT 10
+                """,
+                params
+            )
+            results = cursor.fetchall()
+            if results:
+                print(colorize(f"\n找到 {len(results)} 个匹配玩家:", Colors.CYAN))
+                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+                print(get_separator())
+                for name, rank, lv, acc, crawl_time in results:
+                    print(f"{name}: 排名 {rank}, 等级 {lv}, 准确率 {acc:.2f}%")
+            else:
+                print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
+
+        def _search_charts(self, cursor, keyword, mode):
+            """搜索谱面"""
+            # 使用选择器构建谱面查询条件
+            where_clause, params = self.selector.build_chart_sql_where("c")
+            where_clause += " AND (s.title LIKE ? OR s.artist LIKE ?)"
+            params.extend([f'%{keyword}%', f'%{keyword}%'])
+            
+            cursor.execute(
+                f"""
+                SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
+                    c.creator_name, c.heat, c.donate_count, c.last_updated
+                FROM charts c
+                JOIN songs s ON c.sid = s.sid
+                WHERE {where_clause}
+                ORDER BY c.heat DESC LIMIT 10
+                """,
+                params
+            )
+            results = cursor.fetchall()
+            if results:
+                print(colorize(f"\n找到 {len(results)} 个匹配谱面:", Colors.CYAN))
+                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+                print(get_separator())
+                for cid, version, level, status, title, artist, creator, heat, donate, updated in results:
+                    status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
+                    print(f"  {title} - {artist} (Lv.{level})")
+                    print(f"    版本: {version}, 状态: {status_name}, 热度: {heat}")
+                    print(f"    创作者: {creator}, CID: {cid}")
+            else:
+                print(colorize(f"未找到包含 '{keyword}' 的谱面", Colors.YELLOW))
+
+        def _search_creators(self, cursor, keyword, mode):
+            """搜索创作者"""
+            # 使用选择器构建谱面查询条件
+            where_clause, params = self.selector.build_chart_sql_where("c")
+            where_clause += " AND c.creator_name LIKE ?"
+            params.append(f'%{keyword}%')
+            
+            cursor.execute(
+                f"""
+                SELECT c.creator_name, COUNT(*) as chart_count, 
+                    AVG(c.heat) as avg_heat, MAX(c.heat) as max_heat
+                FROM charts c
+                WHERE {where_clause}
+                GROUP BY c.creator_name
+                ORDER BY chart_count DESC LIMIT 10
+                """,
+                params
+            )
+            results = cursor.fetchall()
+            if results:
+                print(colorize(f"\n找到 {len(results)} 个匹配创作者:", Colors.CYAN))
+                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+                print(get_separator())
+                for creator, count, avg_heat, max_heat in results:
+                    print(f"  {creator}: {count} 个谱面")
+                    print(f"    平均热度: {avg_heat:.1f}, 最高热度: {max_heat}")
+            else:
+                print(colorize(f"未找到包含 '{keyword}' 的创作者", Colors.YELLOW))
+
+
     def _search_players(self, cursor, keyword, mode):
         """搜索玩家（支持名称和UID）"""
         if keyword.isdigit():
@@ -1709,19 +2005,19 @@ class MalodyViz(cmd.Cmd):
                 print(f"    平均热度: {avg_heat:.1f}, 最高热度: {max_heat}")
         else:
             print(colorize(f"未找到包含 '{keyword}' 的创作者", Colors.YELLOW))
-    
+
     @db_safe_operation
     def do_stb_stats(self, arg):
         """
-        谱面基础统计
+        谱面基础统计（支持选择器筛选）
         
         用法: stb_stats [模式]
         参数:
-          模式 - 可选，模式编号，默认为当前模式
+        模式 - 可选，模式编号，默认为当前模式
         
         示例:
-          stb_stats      # 当前模式统计
-          stb_stats 0    # 模式0统计
+        stb_stats      # 当前模式统计
+        stb_stats 0    # 模式0统计
         """
         args = arg.split()
         mode = self.current_mode
@@ -1733,45 +2029,55 @@ class MalodyViz(cmd.Cmd):
                 return
         
         cursor = self.conn.cursor()
-        stats = self._get_chart_stats(cursor, mode)
+        
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        stats = self._get_chart_stats(cursor, where_clause, params)
         self._display_chart_stats(stats, mode)
-    
-    def _get_chart_stats(self, cursor, mode):
+        self._display_chart_stats(stats, mode)
+
+    def _get_chart_stats(self, cursor, where_clause, params):
         """获取谱面统计信息"""
         stats = {}
         
         # 总谱面数
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ?", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
         stats['total_charts'] = cursor.fetchone()[0]
         
         # 按状态统计
         cursor.execute(
-            "SELECT status, COUNT(*) FROM charts WHERE mode = ? GROUP BY status",
-            (mode,)
+            f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+            params
         )
         stats['status_dist'] = dict(cursor.fetchall())
         
-        # 难度统计
+        # 难度统计 - 修复空字符串问题
         cursor.execute(
-            "SELECT level, COUNT(*) FROM charts WHERE mode = ? AND level IS NOT NULL GROUP BY level ORDER BY CAST(level AS REAL)",
-            (mode,)
+            f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+            params
         )
         stats['level_dist'] = dict(cursor.fetchall())
         
         # 创作者统计
         cursor.execute(
-            "SELECT creator_name, COUNT(*) FROM charts WHERE mode = ? AND creator_name IS NOT NULL GROUP BY creator_name ORDER BY COUNT(*) DESC LIMIT 10",
-            (mode,)
+            f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
+            params
         )
         stats['top_creators'] = cursor.fetchall()
         
         # 热度统计
         cursor.execute(
-            "SELECT AVG(heat), MAX(heat), AVG(donate_count), MAX(donate_count) FROM charts WHERE mode = ?",
-            (mode,)
+            f"SELECT AVG(c.heat), MAX(c.heat), AVG(c.donate_count), MAX(c.donate_count) FROM charts c WHERE {where_clause}",
+            params
         )
         heat_stats = cursor.fetchone()
-        stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats
+        stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats or (0, 0, 0, 0)
         
         return stats
     
@@ -1780,16 +2086,22 @@ class MalodyViz(cmd.Cmd):
         mode_name = self.mode_names.get(mode, "未知")
         
         print(colorize(f"\n谱面统计 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
+        
+        if not stats or stats['total_charts'] == 0:
+            print(colorize("没有找到符合条件的谱面", Colors.YELLOW))
+            return
         
         print(f"总谱面数: {colorize(stats['total_charts'], Colors.GREEN)}")
         
         # 状态分布
-        print(f"\n{colorize('状态分布:', Colors.BOLD)}")
-        status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-        for status, count in stats['status_dist'].items():
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"  {status_name}: {count}")
+        if stats['status_dist']:
+            print(f"\n{colorize('状态分布:', Colors.BOLD)}")
+            status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
+            for status, count in stats['status_dist'].items():
+                status_name = status_names.get(status, f"未知({status})")
+                print(f"  {status_name}: {count}")
         
         # 难度分布
         if stats['level_dist']:
@@ -1803,7 +2115,129 @@ class MalodyViz(cmd.Cmd):
             for creator, count in stats['top_creators']:
                 print(f"  {creator}: {count} 个谱面")
         
-        # 热度统计（忽略爱心数）
+        # 热度统计
+        print(f"\n{colorize('热度统计:', Colors.BOLD)}")
+        print(f"  平均热度: {stats['heat_avg']:.1f}")
+        print(f"  最高热度: {stats['heat_max']}")
+        print(f"  平均打赏: {stats['donate_avg']:.1f}")
+        print(f"  最多打赏: {stats['donate_max']}")
+
+    def _get_chart_stats(self, cursor, where_clause, params):
+        """获取谱面统计信息"""
+        stats = {}
+        
+        try:
+            # 总谱面数
+            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
+            stats['total_charts'] = cursor.fetchone()[0]
+            
+            # 按状态统计
+            cursor.execute(
+                f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+                params
+            )
+            stats['status_dist'] = dict(cursor.fetchall())
+            
+            # 难度统计 - 修复空字符串问题
+            cursor.execute(
+                f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+                params
+            )
+            stats['level_dist'] = dict(cursor.fetchall())
+            
+            # 创作者统计
+            cursor.execute(
+                f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
+                params
+            )
+            stats['top_creators'] = cursor.fetchall()
+            
+            # 热度统计
+            cursor.execute(
+                f"SELECT AVG(c.heat), MAX(c.heat), AVG(c.donate_count), MAX(c.donate_count) FROM charts c WHERE {where_clause}",
+                params
+            )
+            heat_stats = cursor.fetchone()
+            stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats or (0, 0, 0, 0)
+            
+        except Exception as e:
+            print(colorize(f"获取统计信息时出错: {e}", Colors.RED))
+            # 返回空的统计字典
+            stats = {
+                'total_charts': 0,
+                'status_dist': {},
+                'level_dist': {},
+                'top_creators': [],
+                'heat_avg': 0,
+                'heat_max': 0,
+                'donate_avg': 0,
+                'donate_max': 0
+            }
+        
+        return stats
+
+    @db_safe_operation
+    def do_stb_stats(self, arg):
+        """
+        谱面基础统计（支持选择器筛选）
+        """
+        args = arg.split()
+        mode = self.current_mode
+        if args:
+            try:
+                mode = int(args[0])
+            except ValueError:
+                print(colorize("错误: 模式必须是数字", Colors.RED))
+                return
+        
+        cursor = self.conn.cursor()
+        
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        stats = self._get_chart_stats(cursor, where_clause, params)
+        self._display_chart_stats(stats, mode)
+
+    def _display_chart_stats(self, stats, mode):
+        """显示谱面统计信息"""
+        mode_name = self.mode_names.get(mode, "未知")
+        
+        print(colorize(f"\n谱面统计 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+        print(get_separator())
+        
+        if not stats or stats['total_charts'] == 0:
+            print(colorize("没有找到符合条件的谱面", Colors.YELLOW))
+            return
+        
+        print(f"总谱面数: {colorize(stats['total_charts'], Colors.GREEN)}")
+        
+        # 状态分布
+        if stats['status_dist']:
+            print(f"\n{colorize('状态分布:', Colors.BOLD)}")
+            status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
+            for status, count in stats['status_dist'].items():
+                status_name = status_names.get(status, f"未知({status})")
+                print(f"  {status_name}: {count}")
+        
+        # 难度分布
+        if stats['level_dist']:
+            print(f"\n{colorize('难度分布:', Colors.BOLD)}")
+            for level, count in sorted(stats['level_dist'].items(), key=lambda x: float(x[0])):
+                print(f"  Lv.{level}: {count}")
+        
+        # 热门创作者
+        if stats['top_creators']:
+            print(f"\n{colorize('热门创作者:', Colors.BOLD)}")
+            for creator, count in stats['top_creators']:
+                print(f"  {creator}: {count} 个谱面")
+        
+        # 热度统计
         print(f"\n{colorize('热度统计:', Colors.BOLD)}")
         print(f"  平均热度: {stats['heat_avg']:.1f}")
         print(f"  最高热度: {stats['heat_max']}")
@@ -1813,16 +2247,16 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_stb_pie(self, arg):
         """
-        生成谱面分布饼状图
+        生成谱面分布饼状图（支持选择器筛选）
         
         用法: stb_pie [模式] [类型]
         参数:
-          模式 - 可选，模式编号，默认为当前模式
-          类型 - 可选，status(状态分布), level(难度分布), 默认为status
+        模式 - 可选，模式编号，默认为当前模式
+        类型 - 可选，status(状态分布), level(难度分布), 默认为status
         
         示例:
-          stb_pie        # 当前模式状态分布饼图
-          stb_pie 0 level # 模式0难度分布饼图
+        stb_pie        # 当前模式状态分布饼图
+        stb_pie 0 level # 模式0难度分布饼图
         """
         args = arg.split()
         mode = self.current_mode
@@ -1850,17 +2284,25 @@ class MalodyViz(cmd.Cmd):
             self._generate_level_pie(cursor, mode)
         else:
             print(colorize(f"错误: 不支持的图表类型 '{chart_type}'", Colors.RED))
-    
+
     def _generate_status_pie(self, cursor, mode):
         """生成状态分布饼图"""
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
         cursor.execute(
-            "SELECT status, COUNT(*) FROM charts WHERE mode = ? GROUP BY status",
-            (mode,)
+            f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+            params
         )
         status_data = cursor.fetchall()
         
         if not status_data:
-            print(colorize(f"模式 {mode} 没有谱面数据", Colors.YELLOW))
+            print(colorize(f"没有找到符合条件的谱面数据", Colors.YELLOW))
             return
         
         status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
@@ -1875,7 +2317,7 @@ class MalodyViz(cmd.Cmd):
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = plt.cm.Set3(np.linspace(0, 1, len(labels)))
         wedges, texts, autotexts = ax.pie(sizes, labels=labels, autopct='%1.1f%%', 
-                                         colors=colors, startangle=90)
+                                        colors=colors, startangle=90)
         
         # 美化文本
         for autotext in autotexts:
@@ -1883,7 +2325,8 @@ class MalodyViz(cmd.Cmd):
             autotext.set_fontweight('bold')
         
         mode_name = self.mode_names.get(mode, "未知")
-        ax.set_title(f'谱面状态分布 - 模式 {mode} ({mode_name})', fontsize=14, fontweight='bold')
+        ax.set_title(f'谱面状态分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}', 
+                    fontsize=14, fontweight='bold')
         
         # 保存图表
         base_filename = f"stb_status_pie_mode{mode}.png"
@@ -1894,33 +2337,51 @@ class MalodyViz(cmd.Cmd):
         plt.close()
         
         print(colorize(f"\n已生成状态分布饼图: {filepath}", Colors.GREEN))
-    
+
     def _generate_level_pie(self, cursor, mode):
         """生成难度分布饼图"""
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        # 过滤无效的难度值
+        where_clause += " AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0"
+        
         cursor.execute(
-            "SELECT level, COUNT(*) FROM charts WHERE mode = ? AND level IS NOT NULL GROUP BY level ORDER BY CAST(level AS REAL)",
-            (mode,)
+            f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+            params
         )
         level_data = cursor.fetchall()
         
         if not level_data:
-            print(colorize(f"模式 {mode} 没有难度数据", Colors.YELLOW))
+            print(colorize(f"没有找到符合条件的难度数据", Colors.YELLOW))
             return
         
         # 分组处理：将难度分组以避免饼图过于碎片化
         level_groups = {}
         for level, count in level_data:
-            level_float = float(level)
-            if level_float < 5:
-                group = "1-4"
-            elif level_float < 10:
-                group = "5-9" 
-            elif level_float < 15:
-                group = "10-14"
-            else:
-                group = "15+"
-            
-            level_groups[group] = level_groups.get(group, 0) + count
+            try:
+                level_float = float(level)
+                if level_float < 5:
+                    group = "1-4"
+                elif level_float < 10:
+                    group = "5-9" 
+                elif level_float < 15:
+                    group = "10-14"
+                else:
+                    group = "15+"
+                
+                level_groups[group] = level_groups.get(group, 0) + count
+            except ValueError:
+                continue
+        
+        if not level_groups:
+            print(colorize("没有有效的难度数据", Colors.YELLOW))
+            return
         
         labels = list(level_groups.keys())
         sizes = list(level_groups.values())
@@ -1929,14 +2390,15 @@ class MalodyViz(cmd.Cmd):
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = plt.cm.viridis(np.linspace(0, 1, len(labels)))
         wedges, texts, autotexts = ax.pie(sizes, labels=labels, autopct='%1.1f%%', 
-                                         colors=colors, startangle=90)
+                                        colors=colors, startangle=90)
         
         for autotext in autotexts:
             autotext.set_color('white')
             autotext.set_fontweight('bold')
         
         mode_name = self.mode_names.get(mode, "未知")
-        ax.set_title(f'谱面难度分布 - 模式 {mode} ({mode_name})', fontsize=14, fontweight='bold')
+        ax.set_title(f'谱面难度分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}', 
+                    fontsize=14, fontweight='bold')
         
         # 保存图表
         base_filename = f"stb_level_pie_mode{mode}.png"
@@ -1947,21 +2409,21 @@ class MalodyViz(cmd.Cmd):
         plt.close()
         
         print(colorize(f"\n已生成难度分布饼图: {filepath}", Colors.GREEN))
-    
+        
     @db_safe_operation
     def do_stb_recent(self, arg):
         """
-        查询最近更新的谱面
+        查询最近更新的谱面（支持选择器筛选）
         
         用法: stb_recent [天数] [模式] [数量]
         参数:
-          天数 - 可选，最近多少天内更新的谱面，默认为7天
-          模式 - 可选，模式编号，默认为当前模式  
-          数量 - 可选，要显示的谱面数量，默认为10
+        天数 - 可选，最近多少天内更新的谱面，默认为7天
+        模式 - 可选，模式编号，默认为当前模式  
+        数量 - 可选，要显示的谱面数量，默认为10
         
         示例:
-          stb_recent        # 最近7天更新的谱面
-          stb_recent 30 0 20 # 模式0最近30天前20个更新谱面
+        stb_recent        # 最近7天更新的谱面
+        stb_recent 30 0 20 # 模式0最近30天前20个更新谱面
         """
         args = arg.split()
         days = 7
@@ -1981,31 +2443,42 @@ class MalodyViz(cmd.Cmd):
         
         cursor = self.conn.cursor()
         
-        # 计算时间范围
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
         
-        cursor.execute(
-            """
-            SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-                   c.creator_name, c.heat, c.last_updated, c.crawl_time
-            FROM charts c
-            JOIN songs s ON c.sid = s.sid
-            WHERE c.mode = ? AND c.last_updated >= ?
-            ORDER BY c.last_updated DESC
-            LIMIT ?
-            """,
-            (mode, start_date, limit)
-        )
+        # 如果选择器中没有时间筛选，使用参数中的天数
+        if not self.selector.filters['time_range']:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            where_clause += " AND c.last_updated >= ?" if where_clause != "1=1" else "c.last_updated >= ?"
+            params.append(start_date)
         
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        query = f"""
+        SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
+            c.creator_name, c.heat, c.last_updated, c.crawl_time
+        FROM charts c
+        JOIN songs s ON c.sid = s.sid
+        WHERE {where_clause}
+        ORDER BY c.last_updated DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        
+        cursor.execute(query, params)
         results = cursor.fetchall()
         
         if not results:
-            print(colorize(f"\n模式 {mode} 最近 {days} 天没有更新的谱面", Colors.YELLOW))
+            print(colorize(f"\n没有找到符合条件的谱面", Colors.YELLOW))
             return
         
         mode_name = self.mode_names.get(mode, "未知")
-        print(colorize(f"\n最近 {days} 天更新的谱面 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"\n最近更新的谱面", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         for cid, version, level, status, title, artist, creator, heat, last_updated, crawl_time in results:
@@ -2101,16 +2574,16 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_stb_summary(self, arg):
         """
-        生成谱面综合统计报告
+        生成谱面综合统计报告（支持选择器筛选）
         
         用法: stb_summary [模式] [详细级别]
         参数:
-          模式 - 可选，模式编号，默认为当前模式
-          详细级别 - 可选，basic(基础), detailed(详细), 默认为basic
+        模式 - 可选，模式编号，默认为当前模式
+        详细级别 - 可选，basic(基础), detailed(详细), 默认为basic
         
         示例:
-          stb_summary           # 当前模式基础统计
-          stb_summary 0 detailed # 模式0详细统计
+        stb_summary           # 当前模式基础统计
+        stb_summary 0 detailed # 模式0详细统计
         """
         args = arg.split()
         mode = self.current_mode
@@ -2141,31 +2614,39 @@ class MalodyViz(cmd.Cmd):
             chart_choice = input(colorize("\n是否生成统计图表? (y/N): ", Colors.CYAN)).lower()
             if chart_choice == 'y':
                 self._generate_summary_charts(stats, mode)
-    
+
     def _get_comprehensive_stats(self, cursor, mode, detail_level):
         """获取综合统计数据"""
         stats = {}
         
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
         # 基础统计
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ?", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
         stats['total_charts'] = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(DISTINCT sid) FROM charts WHERE mode = ?", (mode,))
+        cursor.execute(f"SELECT COUNT(DISTINCT c.sid) FROM charts c WHERE {where_clause}", params)
         stats['unique_songs'] = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(DISTINCT creator_name) FROM charts WHERE mode = ? AND creator_name IS NOT NULL", (mode,))
+        cursor.execute(f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL", params)
         stats['unique_creators'] = cursor.fetchone()[0]
         
         # 时间统计
-        cursor.execute("SELECT MIN(last_updated), MAX(last_updated) FROM charts WHERE mode = ? AND last_updated IS NOT NULL", (mode,))
+        cursor.execute(f"SELECT MIN(c.last_updated), MAX(c.last_updated) FROM charts c WHERE {where_clause} AND c.last_updated IS NOT NULL", params)
         min_max_dates = cursor.fetchone()
         stats['first_update'] = min_max_dates[0]
         stats['last_update'] = min_max_dates[1]
         
         # 热度统计
         cursor.execute(
-            "SELECT AVG(heat), MAX(heat), MIN(heat), STDDEV(heat) FROM charts WHERE mode = ? AND heat > 0",
-            (mode,)
+            f"SELECT AVG(c.heat), MAX(c.heat), MIN(c.heat), STDDEV(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0",
+            params
         )
         heat_stats = cursor.fetchone()
         stats['heat_stats'] = {
@@ -2177,8 +2658,8 @@ class MalodyViz(cmd.Cmd):
         
         # 难度统计
         cursor.execute(
-            "SELECT AVG(CAST(level AS REAL)), MAX(CAST(level AS REAL)), MIN(CAST(level AS REAL)) FROM charts WHERE mode = ? AND level IS NOT NULL",
-            (mode,)
+            f"SELECT AVG(CAST(c.level AS REAL)), MAX(CAST(c.level AS REAL)), MIN(CAST(c.level AS REAL)) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0",
+            params
         )
         level_stats = cursor.fetchone()
         stats['level_stats'] = {
@@ -2189,64 +2670,65 @@ class MalodyViz(cmd.Cmd):
         
         # 状态分布
         cursor.execute(
-            "SELECT status, COUNT(*) FROM charts WHERE mode = ? GROUP BY status",
-            (mode,)
+            f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+            params
         )
         stats['status_dist'] = dict(cursor.fetchall())
         
         if detail_level == "detailed":
             # 详细统计
             cursor.execute(
-                "SELECT creator_name, COUNT(*) as count FROM charts WHERE mode = ? AND creator_name IS NOT NULL GROUP BY creator_name ORDER BY count DESC LIMIT 20",
-                (mode,)
+                f"SELECT c.creator_name, COUNT(*) as count FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY count DESC LIMIT 20",
+                params
             )
             stats['top_creators'] = cursor.fetchall()
             
             cursor.execute(
-                "SELECT level, COUNT(*) as count FROM charts WHERE mode = ? AND level IS NOT NULL GROUP BY level ORDER BY CAST(level AS REAL)",
-                (mode,)
+                f"SELECT c.level, COUNT(*) as count FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0 GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+                params
             )
             stats['level_breakdown'] = cursor.fetchall()
             
             # 热度分布
             cursor.execute(
-                "SELECT COUNT(*) FROM charts WHERE mode = ? AND heat = 0",
-                (mode,)
+                f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.heat = 0",
+                params
             )
             stats['zero_heat'] = cursor.fetchone()[0]
             
             cursor.execute(
-                "SELECT COUNT(*) FROM charts WHERE mode = ? AND heat BETWEEN 1 AND 10",
-                (mode,)
+                f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.heat BETWEEN 1 AND 10",
+                params
             )
             stats['low_heat'] = cursor.fetchone()[0]
             
             cursor.execute(
-                "SELECT COUNT(*) FROM charts WHERE mode = ? AND heat BETWEEN 11 AND 50",
-                (mode,)
+                f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.heat BETWEEN 11 AND 50",
+                params
             )
             stats['medium_heat'] = cursor.fetchone()[0]
             
             cursor.execute(
-                "SELECT COUNT(*) FROM charts WHERE mode = ? AND heat > 50",
-                (mode,)
+                f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.heat > 50",
+                params
             )
             stats['high_heat'] = cursor.fetchone()[0]
             
             # 更新频率统计
             cursor.execute(
-                "SELECT strftime('%Y-%m', last_updated) as month, COUNT(*) FROM charts WHERE mode = ? AND last_updated IS NOT NULL GROUP BY month ORDER BY month DESC LIMIT 12",
-                (mode,)
+                f"SELECT strftime('%Y-%m', c.last_updated) as month, COUNT(*) FROM charts c WHERE {where_clause} AND c.last_updated IS NOT NULL GROUP BY month ORDER BY month DESC LIMIT 12",
+                params
             )
             stats['monthly_updates'] = cursor.fetchall()
         
         return stats
-    
+
     def _display_summary_report(self, stats, mode, detail_level):
         """显示综合统计报告"""
         mode_name = self.mode_names.get(mode, "未知")
         
-        print(colorize(f"\n谱面综合统计报告 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"\n谱面综合统计报告", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         # 基础概览
@@ -2295,10 +2777,11 @@ class MalodyViz(cmd.Cmd):
             # 热度分布
             print(colorize("\n📈 热度分布", Colors.BOLD))
             total_with_heat = stats['total_charts'] - stats['zero_heat']
-            print(f"  无热度: {stats['zero_heat']} ({stats['zero_heat']/stats['total_charts']*100:.1f}%)")
-            print(f"  低热度 (1-10): {stats['low_heat']} ({stats['low_heat']/total_with_heat*100:.1f}%)")
-            print(f"  中热度 (11-50): {stats['medium_heat']} ({stats['medium_heat']/total_with_heat*100:.1f}%)")
-            print(f"  高热度 (50+): {stats['high_heat']} ({stats['high_heat']/total_with_heat*100:.1f}%)")
+            if total_with_heat > 0:
+                print(f"  无热度: {stats['zero_heat']} ({stats['zero_heat']/stats['total_charts']*100:.1f}%)")
+                print(f"  低热度 (1-10): {stats['low_heat']} ({stats['low_heat']/total_with_heat*100:.1f}%)")
+                print(f"  中热度 (11-50): {stats['medium_heat']} ({stats['medium_heat']/total_with_heat*100:.1f}%)")
+                print(f"  高热度 (50+): {stats['high_heat']} ({stats['high_heat']/total_with_heat*100:.1f}%)")
             
             # 月度更新
             if stats['monthly_updates']:
@@ -2380,15 +2863,15 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_stb_quality(self, arg):
         """
-        检查数据质量
+        检查数据质量（支持选择器筛选）
         
         用法: stb_quality [模式]
         参数:
-          模式 - 可选，模式编号，默认为当前模式
+        模式 - 可选，模式编号，默认为当前模式
         
         示例:
-          stb_quality      # 当前模式数据质量检查
-          stb_quality 0    # 模式0数据质量检查
+        stb_quality      # 当前模式数据质量检查
+        stb_quality 0    # 模式0数据质量检查
         """
         args = arg.split()
         mode = self.current_mode
@@ -2401,41 +2884,50 @@ class MalodyViz(cmd.Cmd):
         
         cursor = self.conn.cursor()
         
-        print(colorize(f"\n数据质量检查 - 模式 {mode}", Colors.CYAN))
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        print(colorize(f"\n数据质量检查", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         # 检查数据完整性
         issues = []
         
         # 1. 检查缺失字段
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND creator_name IS NULL", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NULL", params)
         missing_creator = cursor.fetchone()[0]
         if missing_creator > 0:
             issues.append(f"缺失创作者: {missing_creator} 个谱面")
         
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND level IS NULL", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NULL", params)
         missing_level = cursor.fetchone()[0]
         if missing_level > 0:
             issues.append(f"缺失难度: {missing_level} 个谱面")
         
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND last_updated IS NULL", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.last_updated IS NULL", params)
         missing_update = cursor.fetchone()[0]
         if missing_update > 0:
             issues.append(f"缺失更新时间: {missing_update} 个谱面")
         
         # 2. 检查数据一致性
-        cursor.execute("SELECT COUNT(*) FROM charts c LEFT JOIN songs s ON c.sid = s.sid WHERE c.mode = ? AND s.sid IS NULL", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c LEFT JOIN songs s ON c.sid = s.sid WHERE {where_clause} AND s.sid IS NULL", params)
         orphan_charts = cursor.fetchone()[0]
         if orphan_charts > 0:
             issues.append(f"孤立的谱面记录: {orphan_charts} 个")
         
         # 3. 检查异常值
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND heat < 0", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.heat < 0", params)
         negative_heat = cursor.fetchone()[0]
         if negative_heat > 0:
             issues.append(f"负热度值: {negative_heat} 个谱面")
         
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND donate_count < 0", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.donate_count < 0", params)
         negative_donate = cursor.fetchone()[0]
         if negative_donate > 0:
             issues.append(f"负打赏数: {negative_donate} 个谱面")
@@ -2449,7 +2941,7 @@ class MalodyViz(cmd.Cmd):
             print(colorize("✅ 数据质量良好，未发现问题", Colors.GREEN))
         
         # 显示数据完整性统计
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ?", (mode,))
+        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
         total_charts = cursor.fetchone()[0]
         
         completeness_stats = []
@@ -2468,20 +2960,20 @@ class MalodyViz(cmd.Cmd):
         print(colorize("\n📊 数据完整性统计:", Colors.BOLD))
         for stat in completeness_stats:
             print(f"  {stat}")
-    
+            
     @db_safe_operation
     def do_stb_trends(self, arg):
         """
-        分析谱面数据趋势
+        分析谱面数据趋势（支持选择器筛选）
         
         用法: stb_trends [模式] [时间段]
         参数:
-          模式 - 可选，模式编号，默认为当前模式
-          时间段 - 可选，days(天), months(月), 默认为months
+        模式 - 可选，模式编号，默认为当前模式
+        时间段 - 可选，days(天), months(月), 默认为months
         
         示例:
-          stb_trends           # 当前模式月度趋势
-          stb_trends 0 days    # 模式0每日趋势
+        stb_trends           # 当前模式月度趋势
+        stb_trends 0 days    # 模式0每日趋势
         """
         args = arg.split()
         mode = self.current_mode
@@ -2503,27 +2995,50 @@ class MalodyViz(cmd.Cmd):
         
         cursor = self.conn.cursor()
         
+        # 使用选择器构建基础查询条件（排除时间筛选）
+        base_filters = self.selector.filters.copy()
+        base_filters['time_range'] = None
+        temp_selector = MCSelector()
+        temp_selector.set_filters(**base_filters)
+        
+        where_clause, params = temp_selector.build_chart_sql_where("c")
+        
+        # 如果选择器中没有指定模式，使用当前模式
+        if not temp_selector.filters['modes'] and temp_selector.current_mode != -1:
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            params.append(mode)
+        
+        # 添加时间范围条件
         if period == "days":
             # 每日趋势（最近30天）
-            cursor.execute(
-                "SELECT DATE(last_updated), COUNT(*) FROM charts WHERE mode = ? AND last_updated >= date('now', '-30 days') GROUP BY DATE(last_updated) ORDER BY DATE(last_updated)",
-                (mode,)
-            )
-            trend_data = cursor.fetchall()
+            time_condition = "c.last_updated >= date('now', '-30 days')"
+            group_by = "DATE(c.last_updated)"
+            order_by = "DATE(c.last_updated)"
             period_name = "每日"
             x_label = "日期"
         else:
             # 月度趋势（最近12个月）
-            cursor.execute(
-                "SELECT strftime('%Y-%m', last_updated), COUNT(*) FROM charts WHERE mode = ? AND last_updated >= date('now', '-1 year') GROUP BY strftime('%Y-%m', last_updated) ORDER BY strftime('%Y-%m', last_updated)",
-                (mode,)
-            )
-            trend_data = cursor.fetchall()
+            time_condition = "c.last_updated >= date('now', '-1 year')"
+            group_by = "strftime('%Y-%m', c.last_updated)"
+            order_by = "strftime('%Y-%m', c.last_updated)"
             period_name = "月度"
             x_label = "月份"
         
+        where_clause += f" AND {time_condition}" if where_clause != "1=1" else time_condition
+        
+        query = f"""
+        SELECT {group_by}, COUNT(*) 
+        FROM charts c 
+        WHERE {where_clause} 
+        GROUP BY {group_by} 
+        ORDER BY {order_by}
+        """
+        
+        cursor.execute(query, params)
+        trend_data = cursor.fetchall()
+        
         if not trend_data:
-            print(colorize(f"模式 {mode} 没有找到趋势数据", Colors.YELLOW))
+            print(colorize(f"没有找到趋势数据", Colors.YELLOW))
             return
         
         dates = [item[0] for item in trend_data]
@@ -2531,7 +3046,8 @@ class MalodyViz(cmd.Cmd):
         
         # 显示趋势统计
         mode_name = self.mode_names.get(mode, "未知")
-        print(colorize(f"\n谱面{period_name}趋势 - 模式 {mode} ({mode_name})", Colors.CYAN))
+        print(colorize(f"\n谱面{period_name}趋势", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         total_updates = sum(counts)
@@ -2559,7 +3075,7 @@ class MalodyViz(cmd.Cmd):
         # 添加平均线
         ax.axhline(y=avg_updates, color='red', linestyle='--', alpha=0.7, label=f'平均值: {avg_updates:.1f}')
         
-        ax.set_title(f'谱面{period_name}更新趋势 - 模式 {mode} ({mode_name})')
+        ax.set_title(f'谱面{period_name}更新趋势\n筛选条件: {self.selector.get_current_selection()}')
         ax.set_xlabel(x_label)
         ax.set_ylabel('更新谱面数量')
         ax.legend()
@@ -2581,22 +3097,22 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_stb_compare(self, arg):
         """
-        比较不同模式的谱面数据
+        比较不同模式的谱面数据（支持选择器筛选）
         
         用法: stb_compare [模式列表]
         参数:
-          模式列表 - 可选，要比较的模式编号，用逗号分隔，默认为所有模式
+        模式列表 - 可选，要比较的模式编号，用逗号分隔，默认为所有模式
         
         示例:
-          stb_compare           # 比较所有模式
-          stb_compare 0,3,5     # 比较模式0,3,5
+        stb_compare           # 比较所有模式
+        stb_compare 0,3,5     # 比较模式0,3,5
         """
         if arg:
             try:
                 modes = [int(m.strip()) for m in arg.split(',')]
                 # 验证模式有效性
                 for mode in modes:
-                    if mode not in self.mode_names:
+                    if mode not in self.mode_names or mode == -1:
                         print(colorize(f"错误: 模式 {mode} 不存在", Colors.RED))
                         return
             except ValueError:
@@ -2604,28 +3120,44 @@ class MalodyViz(cmd.Cmd):
                 return
         else:
             modes = list(self.mode_names.keys())
+            modes.remove(-1)  # 移除"所有模式"选项
         
         cursor = self.conn.cursor()
         
         print(colorize(f"\n模式比较分析", Colors.CYAN))
+        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
         comparison_data = []
         
         for mode in modes:
-            cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ?", (mode,))
+            # 使用选择器构建谱面查询条件
+            where_clause, params = self.selector.build_chart_sql_where("c")
+            
+            # 覆盖模式筛选，使用当前循环的模式
+            if "c.mode IN" in where_clause or "c.mode =" in where_clause:
+                # 替换现有的模式条件
+                where_clause = re.sub(r'c\.mode IN \(.*?\)|c\.mode = \?', f'c.mode = ?', where_clause)
+                # 更新参数
+                params = [p for p in params if not isinstance(p, int) or p not in modes]
+                params.append(mode)
+            else:
+                where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+                params.append(mode)
+            
+            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
             total_charts = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT creator_name) FROM charts WHERE mode = ? AND creator_name IS NOT NULL", (mode,))
+            cursor.execute(f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL", params)
             unique_creators = cursor.fetchone()[0]
             
-            cursor.execute("SELECT AVG(heat) FROM charts WHERE mode = ? AND heat > 0", (mode,))
+            cursor.execute(f"SELECT AVG(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0", params)
             avg_heat = cursor.fetchone()[0] or 0
             
-            cursor.execute("SELECT AVG(CAST(level AS REAL)) FROM charts WHERE mode = ? AND level IS NOT NULL", (mode,))
+            cursor.execute(f"SELECT AVG(CAST(c.level AS REAL)) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0", params)
             avg_level = cursor.fetchone()[0] or 0
             
-            cursor.execute("SELECT COUNT(*) FROM charts WHERE mode = ? AND status = 2", (mode,))
+            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.status = 2", params)
             stable_charts = cursor.fetchone()[0]
             
             mode_name = self.mode_names.get(mode, "未知")
@@ -2651,12 +3183,56 @@ class MalodyViz(cmd.Cmd):
         for data in comparison_data:
             mode_str = f"{data['mode']} ({data['name']})"
             print(f"{mode_str:<10} {data['name']:<12} {data['total_charts']:<8} {data['unique_creators']:<8} "
-                  f"{data['avg_heat']:<10.1f} {data['avg_level']:<10.1f} {data['stability_rate']:<8.1f}%")
+                f"{data['avg_heat']:<10.1f} {data['avg_level']:<10.1f} {data['stability_rate']:<8.1f}%")
         
         # 生成比较图表
         if len(modes) > 1:
             self._generate_comparison_chart(comparison_data)
-    
+
+    def _generate_comparison_chart(self, comparison_data):
+        """生成模式比较图表"""
+        modes = [f"{d['mode']}\n({d['name']})" for d in comparison_data]
+        total_charts = [d['total_charts'] for d in comparison_data]
+        unique_creators = [d['unique_creators'] for d in comparison_data]
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # 左侧：总谱面数比较
+        bars1 = ax1.bar(modes, total_charts, color='lightblue', alpha=0.7)
+        ax1.set_title('各模式总谱面数比较\n筛选条件: ' + self.selector.get_current_selection())
+        ax1.set_ylabel('谱面数量')
+        ax1.tick_params(axis='x', rotation=45)
+        
+        # 添加数值标签
+        for bar in bars1:
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                    f'{int(height)}', ha='center', va='bottom')
+        
+        # 右侧：创作者数比较
+        bars2 = ax2.bar(modes, unique_creators, color='lightgreen', alpha=0.7)
+        ax2.set_title('各模式创作者数比较\n筛选条件: ' + self.selector.get_current_selection())
+        ax2.set_ylabel('创作者数量')
+        ax2.tick_params(axis='x', rotation=45)
+        
+        # 添加数值标签
+        for bar in bars2:
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                    f'{int(height)}', ha='center', va='bottom')
+        
+        plt.tight_layout()
+        
+        # 保存图表
+        base_filename = "stb_mode_comparison.png"
+        filename = self.get_unique_filename(base_filename, "png")
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, dpi=150, facecolor='white')
+        plt.close()
+        
+        print(colorize(f"\n已生成模式比较图表: {filepath}", Colors.GREEN))
+
+
     def _generate_comparison_chart(self, comparison_data):
         """生成模式比较图表"""
         modes = [f"{d['mode']}\n({d['name']})" for d in comparison_data]
@@ -2770,19 +3346,19 @@ class MalodyViz(cmd.Cmd):
     @db_safe_operation
     def do_export(self, arg):
         """
-        导出数据为CSV文件
+        导出数据为CSV文件（支持选择器筛选）
         
         用法: export <类型> [模式] [天数]
         参数:
-          类型 - 导出类型: top(顶级玩家) 或 history(历史数据)
-          模式 - 可选，模式编号，默认为当前模式
-          天数 - 可选，要导出的历史天数，仅对history类型有效，默认为30天
+        类型 - 导出类型: top(顶级玩家) 或 history(历史数据)
+        模式 - 可选，模式编号，默认为当前模式
+        天数 - 可选，要导出的历史天数，仅对history类型有效，默认为30天
         
         示例:
-          export top        # 导出当前模式的顶级玩家数据
-          export top 0      # 导出模式0的顶级玩家数据
-          export history    # 导出最近30天的历史数据
-          export history 0 60  # 导出模式0最近60天的历史数据
+        export top        # 导出当前模式的顶级玩家数据
+        export top 0      # 导出模式0的顶级玩家数据
+        export history    # 导出最近30天的历史数据
+        export history 0 60  # 导出模式0最近60天的历史数据
         """
         args = arg.split()
         if not args:
@@ -2795,7 +3371,7 @@ class MalodyViz(cmd.Cmd):
         
         if len(args) > 1:
             try:
-                if int(args[1]) in self.mode_names:
+                if int(args[1]) in self.mode_names and int(args[1]) != -1:
                     mode = int(args[1])
                     if len(args) > 2:
                         days = int(args[2])
@@ -2808,73 +3384,96 @@ class MalodyViz(cmd.Cmd):
         cursor = self.conn.cursor()
         
         if export_type == "top":
-            cursor.execute(
-                "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
-                (mode,)
-            )
+            # 使用选择器构建玩家查询条件
+            where_clause, params = self.selector.build_player_sql_where("pr")
+            
+            # 获取最新爬取时间
+            if self.selector.filters['modes']:
+                mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(self.selector.filters['modes'])))
+                cursor.execute(
+                    f"SELECT MAX(crawl_time) FROM player_rankings pr WHERE {mode_condition}",
+                    self.selector.filters['modes']
+                )
+            elif self.selector.current_mode != -1:
+                cursor.execute(
+                    "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
+                    (self.selector.current_mode,)
+                )
+            else:
+                cursor.execute("SELECT MAX(crawl_time) FROM player_rankings")
+            
             latest_time = cursor.fetchone()[0]
             
             if not latest_time:
-                mode_name = self.mode_names.get(mode, "未知")
-                print(colorize(f"\n模式 {mode} ({mode_name}) 没有数据", Colors.YELLOW))
+                print(colorize("没有找到数据", Colors.YELLOW))
                 return
             
-            cursor.execute(
-                """
-                SELECT pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
-                FROM player_rankings pr
-                WHERE pr.mode = ? AND pr.crawl_time = ?
-                ORDER BY pr.rank
-                """,
-                (mode, latest_time)
-            )
+            # 添加时间条件（如果没有设置时间筛选）
+            if not self.selector.filters['time_range']:
+                if "crawl_time" not in where_clause:
+                    where_clause += " AND pr.crawl_time = ?"
+                    params.append(latest_time)
             
+            query = f"""
+            SELECT pr.mode, pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
+            FROM player_rankings pr
+            WHERE {where_clause}
+            ORDER BY pr.mode, pr.rank
+            """
+            
+            cursor.execute(query, params)
             players = cursor.fetchall()
             
             if not players:
-                mode_name = self.mode_names.get(mode, "未知")
-                print(colorize(f"\n模式 {mode} ({mode_name}) 没有找到玩家数据", Colors.YELLOW))
+                print(colorize("没有找到符合条件的玩家", Colors.YELLOW))
                 return 
             
-            df = pd.DataFrame(players, columns=['排名', '玩家名', '等级', '经验', '准确率', '连击', '游玩次数'])
+            df = pd.DataFrame(players, columns=['模式', '排名', '玩家名', '等级', '经验', '准确率', '连击', '游玩次数'])
             
             # 使用唯一文件名避免覆盖
-            base_filename = f"top_players_mode{mode}.csv"
+            base_filename = f"top_players.csv"
             filename = self.get_unique_filename(base_filename, "csv")
             filepath = os.path.join(self.output_dir, filename)
             df.to_csv(filepath, index=False, encoding='utf-8-sig')
             
             print(colorize(f"\n已导出顶级玩家数据: {filepath}", Colors.GREEN))
+            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             
         elif export_type == "history":
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+            # 使用选择器构建玩家查询条件
+            where_clause, params = self.selector.build_player_sql_where("pr")
             
-            cursor.execute(
-                """
-                SELECT pr.name, pr.rank, pr.crawl_time, pr.mode
-                FROM player_rankings pr
-                WHERE pr.crawl_time >= ?
-                ORDER BY pr.crawl_time, pr.mode, pr.rank
-                """,
-                (start_date,)
-            )
+            # 如果选择器中没有时间筛选，使用参数中的天数
+            if not self.selector.filters['time_range']:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=days)
+                where_clause += " AND pr.crawl_time >= ?" if where_clause != "1=1" else "pr.crawl_time >= ?"
+                params.append(start_date)
             
+            query = f"""
+            SELECT pr.name, pr.rank, pr.crawl_time, pr.mode
+            FROM player_rankings pr
+            WHERE {where_clause}
+            ORDER BY pr.crawl_time, pr.mode, pr.rank
+            """
+            
+            cursor.execute(query, params)
             history_data = cursor.fetchall()
             
             if not history_data:
-                print(colorize(f"\n最近 {days} 天没有数据", Colors.YELLOW))
+                print(colorize(f"\n没有找到数据", Colors.YELLOW))
                 return
             
             df = pd.DataFrame(history_data, columns=['玩家名', '排名', '时间', '模式'])
             
             # 使用唯一文件名避免覆盖
-            base_filename = f"history_last{days}days.csv"
+            base_filename = f"history_data.csv"
             filename = self.get_unique_filename(base_filename, "csv")
             filepath = os.path.join(self.output_dir, filename)
             df.to_csv(filepath, index=False, encoding='utf-8-sig')
             
             print(colorize(f"\n已导出历史数据: {filepath}", Colors.GREEN))
+            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             
         else:
             print(colorize("错误: 请指定有效的导出类型: top 或 history", Colors.RED))
