@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Union, Optional, Tuple
 from datetime import datetime, timedelta
 
 class MCSelector:
-    """类似MC的选择器，支持玩家、谱师、难度、时间范围、模式等筛选"""
+    """类似MC的选择器，支持玩家、谱师、难度、时间范围、模式、状态等筛选"""
     
     def __init__(self):
         self.current_mode = -1  # -1 表示所有模式
@@ -12,7 +12,15 @@ class MCSelector:
             'players': [],      # 玩家名称/UID列表（在玩家命令中为玩家，在谱面命令中为谱师）
             'difficulties': [], # 难度范围
             'time_range': None, # 时间范围
-            'modes': []         # 模式列表
+            'modes': [],        # 模式列表
+            'statuses': []      # 谱面状态列表 (0=Alpha, 1=Beta, 2=Stable)
+        }
+        
+        # 状态名称映射
+        self.status_names = {
+            0: "Alpha",
+            1: "Beta", 
+            2: "Stable"
         }
         
     def parse_selector(self, selector_str: str) -> Dict[str, Any]:
@@ -24,13 +32,14 @@ class MCSelector:
           @d[5-10]                    # 选择难度5-10
           @t[7d]                      # 选择最近7天
           @m[0,3,5]                   # 选择模式0,3,5
+          @s[0,2]                     # 选择状态Alpha和Stable
           @*                          # 选择所有
         """
         if not selector_str.strip():
             return {}
             
         result = {}
-        pattern = r'@([pdtm*])\[([^\]]*)\]|@(\*)'
+        pattern = r'@([pdtsm*])\[([^\]]*)\]|@(\*)'
         
         matches = re.findall(pattern, selector_str)
         for match in matches:
@@ -43,6 +52,8 @@ class MCSelector:
                 result['difficulties'] = self._parse_difficulty_range(condition)
             elif selector_type == 't':  # 时间
                 result['time_range'] = self._parse_time_range(condition)
+            elif selector_type == 's':  # 状态
+                result['statuses'] = [int(s.strip()) for s in condition.split(',') if s.strip()]
             elif selector_type == 'm':  # 模式
                 result['modes'] = [int(m.strip()) for m in condition.split(',') if m.strip()]
             elif selector_type == '*':  # 所有
@@ -124,6 +135,8 @@ class MCSelector:
             conditions.append(f"{base_table}.mode = ?")
             params.append(self.current_mode)
         
+        # 注意：玩家命令不应用状态筛选
+        
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         return where_clause, params
     
@@ -166,6 +179,11 @@ class MCSelector:
             conditions.append(f"{base_table}.mode = ?")
             params.append(self.current_mode)
         
+        # 状态筛选
+        if self.filters['statuses']:
+            conditions.append(f"{base_table}.status IN ({','.join(['?']*len(self.filters['statuses']))})")
+            params.extend(self.filters['statuses'])
+        
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         return where_clause, params
     
@@ -181,7 +199,8 @@ class MCSelector:
             'players': [],
             'difficulties': [],
             'time_range': None,
-            'modes': []
+            'modes': [],
+            'statuses': []
         }
     
     def get_current_selection(self) -> str:
@@ -214,6 +233,11 @@ class MCSelector:
             parts.append(f"模式: {self.current_mode}({mode_names.get(self.current_mode, '未知')})")
         else:
             parts.append("模式: 所有")
+        
+        # 添加状态筛选显示
+        if self.filters['statuses']:
+            status_str = ', '.join([f"{s}({self.status_names.get(s, '未知')})" for s in self.filters['statuses']])
+            parts.append(f"状态: {status_str}")
         
         return " | ".join(parts) if parts else "无筛选条件"
 

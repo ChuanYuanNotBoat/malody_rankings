@@ -473,14 +473,31 @@ class STBCrawler:
             else:
                 self.logger.debug("未找到window.malody脚本")
             
-            # 提取状态
-            status_tag = soup.select_one('.song_title .title em.t2')
+            # 修复：提取状态 - 同时检查t1和t2类
+            status_tag = None
+            # 先尝试t1类（Beta状态使用）
+            status_tag = soup.select_one('.song_title .title em.t1')
+            # 如果没有找到t1，尝试t2类（Stable状态使用）
+            if not status_tag:
+                status_tag = soup.select_one('.song_title .title em.t2')
+            # 如果还没有找到，尝试查找任何em标签
+            if not status_tag:
+                status_tag = soup.select_one('.song_title .title em')
+            
             if status_tag:
                 status_text = status_tag.get_text().strip()
                 chart_data["status"] = STATUS_MAP.get(status_text, 0)
                 self.logger.debug("提取状态: %s -> %s", status_text, chart_data["status"])
             else:
                 self.logger.debug("未找到状态标签")
+                # 尝试从其他位置查找状态信息
+                status_elements = soup.find_all('em', class_=re.compile(r't[12]'))
+                for elem in status_elements:
+                    status_text = elem.get_text().strip()
+                    if status_text in STATUS_MAP:
+                        chart_data["status"] = STATUS_MAP[status_text]
+                        self.logger.debug("从备选位置提取状态: %s -> %s", status_text, chart_data["status"])
+                        break
             
             # 提取标题和艺术家
             title_tag = soup.select_one('.song_title .title')
@@ -537,7 +554,7 @@ class STBCrawler:
             
             # 提取创作者信息
             created_by_spans = [span for span in soup.find_all('span') 
-                              if span.get_text().strip().startswith('Created by:')]
+                            if span.get_text().strip().startswith('Created by:')]
             
             if created_by_spans:
                 created_by_span = created_by_spans[0]
@@ -561,7 +578,7 @@ class STBCrawler:
             
             # 提取稳定者信息
             stabled_by_spans = [span for span in soup.find_all('span') 
-                              if span.get_text().strip().startswith('Stabled by:')]
+                            if span.get_text().strip().startswith('Stabled by:')]
             
             if stabled_by_spans:
                 stabled_by_span = stabled_by_spans[0]
@@ -659,8 +676,8 @@ class STBCrawler:
             
             # 记录解析结果
             self.logger.info("解析完成 - 标题: %s, 艺术家: %s, SID: %s, 模式: %s, 状态: %s", 
-                           song_data["title"], song_data["artist"], song_data["sid"], 
-                           chart_data["mode"], chart_data["status"])
+                        song_data["title"], song_data["artist"], song_data["sid"], 
+                        chart_data["mode"], chart_data["status"])
             
             return chart_data, song_data
             
@@ -1703,7 +1720,7 @@ def main():
     parser.add_argument('--no-api', action='store_true', help='不使用API搜索，使用其他数据源')
     parser.add_argument('--source', choices=['all', 'home', 'latest', 'api'], default='all',
                        help='选择数据源: all=全部, home=主页, latest=最近变动, api=API搜索')
-    parser.add_argument('--max-charts', type=int, default=30, help='每个数据源最大爬取数量（默认30）')
+    parser.add_argument('--max-charts', type=int, default=256, help='每个数据源最大爬取数量（默认256）')
     parser.add_argument('--max-retries', type=int, default=3, help='每个数据源最大重试次数（默认3）')
     parser.add_argument('--skip-test', action='store_true', help='跳过连接测试')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
@@ -1723,7 +1740,7 @@ def main():
     parser.add_argument('--sid-crawl', action='store_true', help='启动SID优先爬取')
     parser.add_argument('--start-sid', type=int, default=1, help='起始SID（默认1）')
     parser.add_argument('--end-sid', type=int, help='结束SID（默认无限制）')
-    parser.add_argument('--max-cids-per-song', type=int, default=50, help='每首歌曲最大CID数量（默认50）')
+    parser.add_argument('--max-cids-per-song', type=int, default=999, help='每首歌曲最大CID数量（默认999）')
     parser.add_argument('--no-skip-empty', action='store_true', help='不跳过空歌曲')
     parser.add_argument('--sid-progress-file', default='sid_progress.json', help='SID进度文件路径')
     parser.add_argument('--sid-status', action='store_true', help='显示SID爬取状态')
