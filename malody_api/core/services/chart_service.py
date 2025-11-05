@@ -1,7 +1,7 @@
 # malody_api/core/services/chart_service.py
 import sqlite3
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from ...core.database import get_db_connection, db_safe_operation
 from ...core.models import ChartStats, HotChart, CreatorStats
 from ...utils.selector import MCSelector

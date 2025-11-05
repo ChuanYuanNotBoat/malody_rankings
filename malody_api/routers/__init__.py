@@ -1,14 +1,14 @@
-# malody_api/routers/__init__.py (更新)
+# malody_api/routers/__init__.py
 from .players import router as players_router
 from .charts import router as charts_router
 from .analytics import router as analytics_router
 from .system import router as system_router
-from .query import router as query_router  # 新增
+from .query import router as query_router
 
 __all__ = [
     "players_router", 
     "charts_router", 
     "analytics_router", 
     "system_router",
-    "query_router"  # 新增
+    "query_router"
 ]

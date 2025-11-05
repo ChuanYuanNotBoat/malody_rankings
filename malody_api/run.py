@@ -24,6 +24,12 @@ def main():
         print("请确保malody_rankings.db文件在当前目录下")
         sys.exit(1)
     
+    # 创建静态文件目录
+    static_dir = os.path.join(current_dir, "static")
+    if not os.path.exists(static_dir):
+        os.makedirs(static_dir)
+        print(f"创建静态文件目录: {static_dir}")
+    
     print("启动Malody数据API服务器...")
     print(f"数据库文件: {db_path}")
     print("文档地址: http://localhost:8000/docs")

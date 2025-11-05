@@ -21,6 +21,9 @@ class Config:
     # 日志配置
     LOG_LEVEL: str = os.getenv("MALODY_LOG_LEVEL", "info")
     
+    # 静态文件配置
+    STATIC_DIR: str = os.getenv("MALODY_STATIC_DIR", "static")
+    
     @classmethod
     def validate(cls):
         """验证配置"""
@@ -29,6 +32,10 @@ class Config:
         
         if not (1 <= cls.PORT <= 65535):
             raise ValueError(f"端口号必须在1-65535之间: {cls.PORT}")
+        
+        # 确保静态文件目录存在
+        if not os.path.exists(cls.STATIC_DIR):
+            os.makedirs(cls.STATIC_DIR)
 
 # 创建配置实例
 config = Config()

@@ -11,3 +11,7 @@ malody_api/routers/__pycache__/*
 malody_api/core/services/__pycache__/*
 malody_api/routers/__pycache__/*
 sid_backwards_progress.json
+malody_api/__pycache__/*
+malody_api/core/__pycache__/*
+*.bak
+*.pyc
