@@ -1692,6 +1692,220 @@ class STBCrawler:
         except Exception as e:
             return f"读取SID进度文件失败: {e}"
 
+    def crawl_sid_backwards(self, start_sid=None, max_requests_per_minute=10, 
+                           progress_file="sid_backwards_progress.json", resume=True):
+        """
+        向后爬取SID，直到遇到404自动停止
+        
+        Args:
+            start_sid: 起始SID（如果为None则从进度文件恢复或从1开始）
+            max_requests_per_minute: 每分钟最大请求数
+            progress_file: 进度文件路径
+            resume: 是否从进度恢复
+        """
+        self.logger.info("=== 启动向后SID爬取模式 ===")
+        
+        # 加载或初始化进度
+        if resume and os.path.exists(progress_file):
+            progress = self._load_sid_backwards_progress(progress_file)
+            current_sid = progress.get('current_sid')
+            last_valid_sid = progress.get('last_valid_sid')
+            total_songs = progress.get('total_songs', 0)
+            total_charts = progress.get('total_charts', 0)
+            total_errors = progress.get('total_errors', 0)
+            consecutive_404s = progress.get('consecutive_404s', 0)
+            
+            self.logger.info("从进度文件恢复: 当前SID=%s, 最后有效SID=%s, 歌曲=%d, 谱面=%d, 错误=%d, 连续404=%d", 
+                           current_sid, last_valid_sid, total_songs, total_charts, total_errors, consecutive_404s)
+            
+            # 如果没有当前SID，使用最后有效SID或起始SID
+            if current_sid is None:
+                current_sid = last_valid_sid if last_valid_sid else start_sid
+        else:
+            current_sid = start_sid if start_sid else 1
+            last_valid_sid = None
+            total_songs = 0
+            total_charts = 0
+            total_errors = 0
+            consecutive_404s = 0
+            self.logger.info("从头开始爬取，起始SID: %s", current_sid)
+        
+        if current_sid is None:
+            self.logger.error("无法确定起始SID，请指定start_sid参数")
+            return total_songs, total_charts
+        
+        # 计算请求间隔
+        request_interval = 60.0 / max_requests_per_minute
+        self.logger.info("请求间隔: %.1f秒", request_interval)
+        
+        max_consecutive_404s = 10  # 连续遇到10个404就认为到达末尾
+        
+        try:
+            while not stop_requested and consecutive_404s < max_consecutive_404s:
+                self.logger.info("处理 SID %d (连续404: %d/%d)", 
+                               current_sid, consecutive_404s, max_consecutive_404s)
+                
+                # 检查是否已处理过（避免重复）
+                if current_sid in self.processed_songs:
+                    self.logger.debug("SID %d 已处理过，跳过", current_sid)
+                    current_sid += 1
+                    continue
+                
+                # 获取该SID下的所有CID
+                cids = self.get_charts_from_song_page(current_sid)
+                
+                if cids:
+                    # 成功获取到CID，重置404计数
+                    consecutive_404s = 0
+                    last_valid_sid = current_sid
+                    
+                    self.logger.info("SID %d 有 %d 个谱面", current_sid, len(cids))
+                    
+                    # 爬取该SID下的所有CID
+                    song_success_count = 0
+                    for cid in cids:
+                        if stop_requested:
+                            break
+                        
+                        # 跳过已处理的CID
+                        if cid in self.processed_charts:
+                            continue
+                        
+                        self.logger.info("爬取 CID %d (SID %d 的第 %d/%d 个谱面)", 
+                                       cid, current_sid, song_success_count + 1, len(cids))
+                        
+                        result = self.crawl_chart_detail_with_retry(cid)
+                        
+                        if result is True:  # 成功
+                            song_success_count += 1
+                            total_charts += 1
+                            self.logger.info("✓ CID %d 成功 (SID %d: %d/%d)", 
+                                           cid, current_sid, song_success_count, len(cids))
+                        elif result is None:  # 明确不存在
+                            self.logger.debug("CID %d 不存在", cid)
+                        else:  # 失败
+                            total_errors += 1
+                            self.logger.warning("CID %d 爬取失败", cid)
+                        
+                        # CID之间的延迟
+                        time.sleep(request_interval)
+                    
+                    if song_success_count > 0:
+                        total_songs += 1
+                        self.logger.info("✓ SID %d 完成: %d/%d 个谱面成功", 
+                                       current_sid, song_success_count, len(cids))
+                    else:
+                        self.logger.info("SID %d 没有新谱面需要爬取", current_sid)
+                    
+                else:
+                    # 没有找到CID，增加404计数
+                    consecutive_404s += 1
+                    self.logger.info("SID %d 返回空数据 (连续404: %d/%d)", 
+                                   current_sid, consecutive_404s, max_consecutive_404s)
+                    
+                    # 如果是第一个404，记录为可能的最后一个有效SID
+                    if consecutive_404s == 1 and last_valid_sid is None and current_sid > 1:
+                        last_valid_sid = current_sid - 1
+                        self.logger.info("第一个404，记录最后有效SID为: %d", last_valid_sid)
+                
+                # 移动到下一个SID
+                current_sid += 1
+                
+                # 定期保存进度（每10个SID或每遇到404时）
+                if (current_sid % 10 == 0 or consecutive_404s > 0 or 
+                    stop_requested or consecutive_404s >= max_consecutive_404s):
+                    self._save_sid_backwards_progress(
+                        progress_file, current_sid, last_valid_sid, total_songs, 
+                        total_charts, total_errors, consecutive_404s
+                    )
+                    self.logger.debug("进度保存: SID=%d, 最后有效=%s, 歌曲=%d, 谱面=%d, 错误=%d, 连续404=%d", 
+                                    current_sid, last_valid_sid, total_songs, total_charts, total_errors, consecutive_404s)
+                
+                # SID之间的延迟
+                actual_delay = request_interval * (1.0 + 0.5 * random.random())
+                time.sleep(actual_delay)
+                    
+        except KeyboardInterrupt:
+            self.logger.info("用户主动中断爬取")
+        except Exception as e:
+            self.logger.error("向后SID爬取出错: %s", e, exc_info=True)
+        finally:
+            # 最终保存进度
+            self._save_sid_backwards_progress(
+                progress_file, current_sid, last_valid_sid, total_songs,
+                total_charts, total_errors, consecutive_404s
+            )
+            
+            if consecutive_404s >= max_consecutive_404s:
+                self.logger.info("已达到连续 %d 个404，自动停止爬取", max_consecutive_404s)
+                if last_valid_sid:
+                    self.logger.info("检测到的最后一个有效SID: %d", last_valid_sid)
+            
+            self.logger.info("向后SID爬取完成: 歌曲 %d, 谱面 %d, 错误 %d", 
+                           total_songs, total_charts, total_errors)
+        
+        return total_songs, total_charts
+
+    def _save_sid_backwards_progress(self, progress_file, current_sid, last_valid_sid, 
+                                   total_songs, total_charts, total_errors, consecutive_404s):
+        """保存向后SID爬取进度"""
+        try:
+            progress = {
+                'current_sid': current_sid,
+                'last_valid_sid': last_valid_sid,
+                'total_songs': total_songs,
+                'total_charts': total_charts,
+                'total_errors': total_errors,
+                'consecutive_404s': consecutive_404s,
+                'last_save': datetime.now().isoformat(),
+                'processed_charts_count': len(self.processed_charts),
+                'processed_songs_count': len(self.processed_songs)
+            }
+            
+            with open(progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            self.logger.error("保存向后SID进度文件失败: %s", e)
+
+    def _load_sid_backwards_progress(self, progress_file):
+        """加载向后SID爬取进度"""
+        try:
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning("加载向后SID进度文件失败: %s，使用默认值", e)
+            return {}
+
+    def get_sid_backwards_progress_status(self, progress_file="sid_backwards_progress.json"):
+        """获取向后SID爬取状态"""
+        if not os.path.exists(progress_file):
+            return "无向后SID进度文件"
+        
+        try:
+            progress = self._load_sid_backwards_progress(progress_file)
+            current_sid = progress.get('current_sid', '未知')
+            last_valid_sid = progress.get('last_valid_sid', '未知')
+            total_songs = progress.get('total_songs', 0)
+            total_charts = progress.get('total_charts', 0)
+            total_errors = progress.get('total_errors', 0)
+            consecutive_404s = progress.get('consecutive_404s', 0)
+            last_save = progress.get('last_save', '未知')
+            
+            status = (
+                f"当前SID: {current_sid}\n"
+                f"最后有效SID: {last_valid_sid}\n"
+                f"成功歌曲: {total_songs}\n"
+                f"成功谱面: {total_charts}\n"
+                f"错误: {total_errors}\n"
+                f"连续404: {consecutive_404s}\n"
+                f"最后保存: {last_save}"
+            )
+            return status
+            
+        except Exception as e:
+            return f"读取向后SID进度文件失败: {e}"
+
     def test_api(self):
         """测试API访问"""
         try:
@@ -1745,6 +1959,14 @@ def main():
     parser.add_argument('--sid-progress-file', default='sid_progress.json', help='SID进度文件路径')
     parser.add_argument('--sid-status', action='store_true', help='显示SID爬取状态')
     
+    # 新增的向后SID爬取参数
+    parser.add_argument('--sid-backwards', action='store_true', help='启动向后SID爬取模式')
+    parser.add_argument('--start-sid-backwards', type=int, help='向后爬取的起始SID（默认从进度恢复或从1开始）')
+    parser.add_argument('--sid-backwards-rpm', type=int, default=10, help='向后SID爬取每分钟请求数（默认10）')
+    parser.add_argument('--sid-backwards-progress-file', default='sid_backwards_progress.json', 
+                       help='向后SID进度文件路径')
+    parser.add_argument('--sid-backwards-status', action='store_true', help='显示向后SID爬取状态')
+    
     args = parser.parse_args()
     
     # 设置详细日志
@@ -1766,6 +1988,13 @@ def main():
         crawler = STBCrawler()
         status = crawler.get_sid_progress_status(args.sid_progress_file)
         print("SID爬取状态:")
+        print(status)
+        return
+    
+    if args.sid_backwards_status:
+        crawler = STBCrawler()
+        status = crawler.get_sid_backwards_progress_status(args.sid_backwards_progress_file)
+        print("向后SID爬取状态:")
         print(status)
         return
     
@@ -1795,6 +2024,18 @@ def main():
             logger.info("API测试成功")
         else:
             logger.error("API测试失败")
+        return
+    
+    # 向后SID爬取模式
+    if args.sid_backwards:
+        logger.info("启动向后SID爬取模式")
+        songs, charts = crawler.crawl_sid_backwards(
+            start_sid=args.start_sid_backwards,
+            max_requests_per_minute=args.sid_backwards_rpm,
+            progress_file=args.sid_backwards_progress_file,
+            resume=not args.no_resume
+        )
+        logger.info("向后SID爬取完成: %d 首歌曲, %d 个谱面", songs, charts)
         return
     
     # SID优先爬取模式

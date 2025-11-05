@@ -6,3 +6,7 @@ __pycache__/*
 sid_progress.json
 cid_progress.json
 logs/*
+malody_api/utils/__pycache__/*
+malody_api/routers/__pycache__/*
+malody_api/core/services/__pycache__/*
+malody_api/routers/__pycache__/*
