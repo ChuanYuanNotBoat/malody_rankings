@@ -6,14 +6,34 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 import os
-import json
+import sys
 
-# 修复导入路径 - 改为绝对导入
-from malody_api.routers.players import router as players_router
-from malody_api.routers.charts import router as charts_router
-from malody_api.routers.analytics import router as analytics_router
-from malody_api.routers.system import router as system_router
-from malody_api.routers.query import router as query_router
+# 添加当前目录到 Python 路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+# 修复导入路径 - 使用相对导入
+try:
+    from routers.players import router as players_router
+    from routers.charts import router as charts_router
+    from routers.analytics import router as analytics_router
+    from routers.system import router as system_router
+    from routers.query import router as query_router
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入
+    try:
+        from malody_api.routers.players import router as players_router
+        from malody_api.routers.charts import router as charts_router
+        from malody_api.routers.analytics import router as analytics_router
+        from malody_api.routers.system import router as system_router
+        from malody_api.routers.query import router as query_router
+    except ImportError:
+        print("错误: 无法导入路由模块")
+        print("请确保:")
+        print("1. 在 malody_api 目录中运行")
+        print("2. 所有路由文件存在于 routers 目录中")
+        sys.exit(1)
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -202,6 +222,7 @@ app.openapi = custom_openapi
 
 if __name__ == "__main__":
     import uvicorn
+    # 直接运行时使用相对路径
     uvicorn.run(
         "app:app",
         host="0.0.0.0", 
