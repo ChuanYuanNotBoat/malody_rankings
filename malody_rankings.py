@@ -49,10 +49,10 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
-# 替换为你自己的 Cookie 信息
+# Cookie配置
 COOKIES = {
-    "sessionid": "ufaq36f8cref9gn73v4r3qjjiprngu2b",
-    "csrftoken": "7XOJDuypZB9ACYJqVhTHA2t2BksYSehe"
+    "sessionid": "xe9n2pkue11qtkams0alrm9mgpkwwtsr",
+    "csrftoken": "1vTuvnNMyjQswtukKd8q7dPZDOW22aEu"
 }
 
 HEADERS = {
@@ -94,7 +94,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def get_git_commit_message():
-    """动态生成Git提交消息"""
+    """生成Git提交消息"""
     return datetime.now().strftime("%Y-%m-%d %H:%M updated")
 
 class DatabaseManager:
@@ -172,34 +172,28 @@ def migrate_database():
         columns = [column[1] for column in cursor.fetchall()]
         
         if 'uid' not in columns:
-            # 添加uid字段到player_identity表
             cursor.execute('ALTER TABLE player_identity ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
             logger.info("已添加uid字段到player_identity表")
         
-        # 检查player_aliases表
         cursor.execute("PRAGMA table_info(player_aliases)")
         columns = [column[1] for column in cursor.fetchall()]
         
         if 'uid' not in columns:
-            # 添加uid字段到player_aliases表
             cursor.execute('ALTER TABLE player_aliases ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
             logger.info("已添加uid字段到player_aliases表")
         
-        # 检查player_rankings表
         cursor.execute("PRAGMA table_info(player_rankings)")
         columns = [column[1] for column in cursor.fetchall()]
         
         if 'uid' not in columns:
-            # 添加uid字段到player_rankings表
             cursor.execute('ALTER TABLE player_rankings ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
             logger.info("已添加uid字段到player_rankings表")
         
         db_manager.get_connection().commit()
         
-        # 记录SQL变更
         with open('sql_changes.md', 'w', encoding='utf-8') as f:
             f.write("# SQL数据库结构变更记录\n\n")
             f.write("## 版本 2.0 - 添加UID支持\n\n")
@@ -281,7 +275,6 @@ def init_database():
         )
         ''')
         
-        # 新增玩家配置表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_config (
             config_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,7 +288,6 @@ def init_database():
         )
         ''')
         
-        # 新增玩家爬取状态表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_crawl_status (
             player_identifier TEXT PRIMARY KEY,
@@ -306,7 +298,6 @@ def init_database():
         )
         ''')
         
-        # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
@@ -320,7 +311,6 @@ def init_database():
         db_manager.get_connection().commit()
         logger.info("数据库初始化完成")
         
-        # 初始化后执行迁移
         migrate_database()
         
     except Exception as e:
@@ -335,7 +325,6 @@ def resolve_player_identity(name, crawl_time, uid=None):
     try:
         player_id = None
         
-        # 优先使用uid查找
         if uid:
             try:
                 cursor.execute(
@@ -347,25 +336,21 @@ def resolve_player_identity(name, crawl_time, uid=None):
                 if result:
                     player_id = result[0]
                     
-                    # 更新最后出现时间
                     cursor.execute(
                         "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
                         (crawl_time, name, player_id)
                     )
                     
-                    # 检查别名是否存在
                     cursor.execute(
                         "SELECT alias_id FROM player_aliases WHERE player_id = ? AND alias = ?",
                         (player_id, name)
                     )
                     if not cursor.fetchone():
-                        # 添加新别名
                         cursor.execute(
                             "INSERT INTO player_aliases (player_id, uid, alias, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
                             (player_id, uid, name, crawl_time, crawl_time)
                         )
                     else:
-                        # 更新现有别名
                         cursor.execute(
                             "UPDATE player_aliases SET last_seen = ? WHERE player_id = ? AND alias = ?",
                             (crawl_time, player_id, name)
@@ -373,12 +358,10 @@ def resolve_player_identity(name, crawl_time, uid=None):
             except sqlite3.OperationalError as e:
                 if "no such column: uid" in str(e):
                     logger.warning("uid列不存在，回退到名称查找")
-                    # 回退到名称查找
                     pass
                 else:
                     raise
         
-        # 如果没有uid或通过uid没找到，使用名称查找
         if not player_id:
             cursor.execute(
                 "SELECT player_id FROM player_aliases WHERE alias = ?",
@@ -389,7 +372,6 @@ def resolve_player_identity(name, crawl_time, uid=None):
             if result:
                 player_id = result[0]
                 
-                # 如果提供了uid，更新uid信息
                 if uid:
                     try:
                         cursor.execute(
@@ -406,7 +388,6 @@ def resolve_player_identity(name, crawl_time, uid=None):
                         else:
                             raise
                 
-                # 更新最后出现时间
                 cursor.execute(
                     "UPDATE player_aliases SET last_seen = ? WHERE alias = ?",
                     (crawl_time, name)
@@ -416,7 +397,6 @@ def resolve_player_identity(name, crawl_time, uid=None):
                     (crawl_time, name, player_id)
                 )
             else:
-                # 创建新玩家
                 cursor.execute(
                     "INSERT INTO player_identity (uid, current_name, first_seen, last_seen) VALUES (?, ?, ?, ?)",
                     (uid, name, crawl_time, crawl_time)
@@ -516,11 +496,9 @@ def parse_player_list(html):
         combo_tag = item.select_one("span.combo")
         pc_tag = item.select_one("span.pc, span[class*=pc]")
         
-        # 从链接中提取玩家ID
         player_id = None
         if name_tag and name_tag.has_attr('href'):
             href = name_tag['href']
-            # 从类似 /accounts/user/123456 的链接中提取ID
             match = re.search(r'/accounts/user/(\d+)', href)
             if match:
                 player_id = match.group(1)
@@ -574,7 +552,6 @@ def parse_player_list(html):
         pc_tag = item.select_one("span.pc, span[class*=pc]")
         combo_tag = item.select_one("span.combo")
         
-        # 从链接中提取玩家ID
         player_id = None
         if name_tag and name_tag.has_attr('href'):
             href = name_tag['href']
@@ -652,16 +629,13 @@ def parse_player_profile(html, player_id):
     soup = BeautifulSoup(html, "html.parser")
     player_data = []
     
-    # 获取玩家名称
     name_tag = soup.select_one("div.user_head .name span")
     player_name = name_tag.text.strip() if name_tag else f"玩家_{player_id}"
     
-    # 解析各模式数据
     rank_items = soup.select("div.rank .item")
     
     for item in rank_items:
         try:
-            # 获取模式
             img_tag = item.select_one("img")
             if not img_tag or not img_tag.has_attr('src'):
                 continue
@@ -691,7 +665,6 @@ def parse_player_profile(html, player_id):
             else:
                 continue
             
-            # 获取排名
             rank_tag = item.select_one("p.rank")
             if not rank_tag:
                 continue
@@ -705,7 +678,6 @@ def parse_player_profile(html, player_id):
             else:
                 continue
             
-            # 获取其他数据
             data_spans = item.select("p span")
             exp = 0
             playcount = 0
@@ -738,7 +710,7 @@ def parse_player_profile(html, player_id):
             player_data.append({
                 "rank": rank,
                 "name": player_name,
-                "lv": 0,  # 个人主页不显示等级
+                "lv": 0,
                 "exp": exp,
                 "acc": acc,
                 "combo": combo,
@@ -755,7 +727,6 @@ def parse_player_profile(html, player_id):
 def crawl_player_profile(session, player_identifier):
     """爬取玩家个人主页数据"""
     try:
-        # 现在只支持玩家ID
         if not player_identifier.isdigit():
             logger.warning("玩家标识符必须是数字ID: %s", player_identifier)
             return None
@@ -804,6 +775,7 @@ def crawl_mode_player(session, mode):
     return df
 
 def save_data_to_excel(mode, df, timestamp):
+    """保存数据到Excel文件（仅在启用Excel保存时使用）"""
     if df.empty:
         logger.warning("模式 %d 无有效数据，跳过保存", mode)
         return
@@ -904,7 +876,6 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', data_to_insert)
             
-            # 更新玩家爬取状态
             cursor.execute('''
             INSERT OR REPLACE INTO player_crawl_status 
             (player_identifier, last_crawled, crawl_count, success_count, last_error)
@@ -918,7 +889,6 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
     except Exception as e:
         logger.error("保存玩家 %s 数据到数据库失败: %s", player_identifier, e)
         
-        # 记录错误
         try:
             cursor.execute('''
             INSERT OR REPLACE INTO player_crawl_status 
@@ -1272,8 +1242,7 @@ def run_player_crawler():
                     if HAS_TQDM:
                         pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
                 
-                # 延迟以避免请求过于频繁
-                time.sleep(3)  # 增加到3秒，减轻服务器压力
+                time.sleep(3)
                 
             except Exception as e:
                 logger.error("处理玩家 %s 时出错: %s", player_identifier, e)
@@ -1358,7 +1327,6 @@ def git_pull_data_files():
             logger.info("当前目录不是Git仓库，跳过Git拉取")
             return False
             
-        # 添加用户确认环节
         print("\n" + "="*60)
         print("检测到远程仓库有更新！")
         print("更新文件包括: catch.xlsx, key.xlsx, malody_rankings.db 等数据文件")
@@ -1370,7 +1338,6 @@ def git_pull_data_files():
         print("  - 10秒内无响应将自动跳过")
         print("="*60)
         
-        # 设置10秒超时
         try:
             import select
             import sys
@@ -1395,7 +1362,6 @@ def git_pull_data_files():
                 return False
                 
         except ImportError:
-            # 如果select不可用，使用简单方法
             print("请确认是否拉取更新 (y/n, 10秒超时): ", end='', flush=True)
             user_input = input()
             if user_input.lower() in ['y', 'yes']:
@@ -1535,11 +1501,12 @@ def check_data_changed(mode, df):
         
     return True
 
-def run_crawler_cycle(crawl_players=False):
+def run_crawler_cycle(crawl_players=False, save_excel=False):
     """运行爬取周期
     
     Args:
         crawl_players: 是否爬取玩家主页数据
+        save_excel: 是否保存数据到Excel文件
     """
     try:
         if git_check_updates():
@@ -1583,12 +1550,17 @@ def run_crawler_cycle(crawl_players=False):
                 logger.warning("模式 %d 获取数据为空，跳过", mode)
                 continue
                 
-            if not check_data_changed(mode, df):
+            if save_excel and not check_data_changed(mode, df):
                 logger.info("模式 %d 数据未变化，跳过保存", mode)
                 continue
                 
             crawl_time = datetime.now()
-            save_data_to_excel(mode, df, crawl_time)
+            
+            # 只有在启用Excel保存时才保存到Excel
+            if save_excel:
+                save_data_to_excel(mode, df, crawl_time)
+                
+            # 始终保存到数据库
             save_to_database(mode, df, crawl_time)
             has_changes = True
             
@@ -1596,17 +1568,14 @@ def run_crawler_cycle(crawl_players=False):
         except Exception as e:
             logger.exception("处理模式 %d 时发生错误", mode)
     
-    # 只有在明确要求时才爬取玩家主页
     if crawl_players and all_dfs:
         leaderboard_players = get_players_from_leaderboard(all_dfs)
         if leaderboard_players:
             add_players_to_queue(leaderboard_players)
             logger.info("从排行榜添加了 %d 个玩家到爬取队列", len(leaderboard_players))
         
-        # 启动玩家爬取器（在后台运行）
         start_player_crawler_thread()
     
-    # 自动提交保持不变，不需要确认
     try:
         git_add_commit_push(has_changes)
     except Exception as e:
@@ -1632,6 +1601,8 @@ def parse_arguments():
                        help='只导入历史数据')
     parser.add_argument('--once', action='store_true', 
                        help='运行一次爬取周期后退出')
+    parser.add_argument('--save-excel', action='store_true',
+                       help='保存数据到Excel文件（默认不保存）')
     
     return parser.parse_args()
 
@@ -1649,15 +1620,12 @@ def run_players_only():
 def main():
     args = parse_arguments()
     
-    # 处理数据库迁移
     if args.migrate_db:
         migrate_database()
         return
     
-    # 初始化数据库
     init_database()
     
-    # 加载配置文件中的玩家
     config_players = load_player_config()
     if config_players:
         add_players_to_queue(config_players)
@@ -1676,7 +1644,6 @@ def main():
     else:
         logger.info("数据库中已有 %d 条记录，跳过历史数据导入", count)
     
-    # 根据参数执行不同的操作
     if args.import_only:
         DatabaseManager().close_connection()
         return
@@ -1684,12 +1651,10 @@ def main():
         run_players_only()
         return
     elif args.once:
-        # 单次运行
-        run_crawler_cycle(crawl_players=args.all)
+        run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel)
         DatabaseManager().close_connection()
         return
     else:
-        # 持续运行模式
         try:
             while True:
                 with stop_lock:
@@ -1698,8 +1663,7 @@ def main():
                         break
                 
                 try:
-                    # 默认只爬排行榜，只有--all参数时才爬玩家主页
-                    run_crawler_cycle(crawl_players=args.all)
+                    run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel)
                 except Exception as e:
                     logger.exception("主循环发生未处理异常")
                 

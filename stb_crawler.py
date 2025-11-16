@@ -818,7 +818,7 @@ class STBCrawler:
         return hashlib.md5(data_str.encode('utf-8')).hexdigest()
 
     def save_chart_data(self, chart_data, song_data):
-        """保存谱面数据到数据库 - 覆盖更新模式"""
+        """保存谱面数据到数据库 - 覆盖更新模式，如果封面缺失则保留原来的封面"""
         cursor = self.db_manager.get_connection().cursor()
         crawl_time = datetime.now()
         
@@ -837,14 +837,25 @@ class STBCrawler:
                            chart_data["cid"], song_data["sid"], song_data["title"], 
                            song_data["artist"], chart_data["mode"], chart_data["status"])
             
+            # 检查歌曲是否已存在，如果存在且新封面为空，则使用原来的封面
+            existing_cover_url = None
+            if not song_data["cover_url"]:
+                cursor.execute("SELECT cover_url FROM songs WHERE sid = ?", (song_data["sid"],))
+                result = cursor.fetchone()
+                if result and result[0]:
+                    existing_cover_url = result[0]
+                    self.logger.info("封面为空，使用数据库中已有的封面: %s", existing_cover_url)
+            
             # 保存歌曲信息 - 使用 REPLACE 覆盖更新
+            final_cover_url = song_data["cover_url"] if song_data["cover_url"] else existing_cover_url
+            
             cursor.execute('''
             INSERT OR REPLACE INTO songs 
             (sid, title, artist, bpm, length, cover_url, last_updated, crawl_time, data_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 song_data["sid"], song_data["title"], song_data["artist"], 
-                song_data["bpm"], song_data["length"], song_data["cover_url"],
+                song_data["bpm"], song_data["length"], final_cover_url,
                 chart_data["last_updated"], crawl_time, song_hash
             ))
             
@@ -1906,6 +1917,153 @@ class STBCrawler:
         except Exception as e:
             return f"读取向后SID进度文件失败: {e}"
 
+    def retry_failed_items(self, progress_files=None, requests_per_minute=5, 
+                          max_retries=3, remove_successful=True):
+        """
+        重新爬取所有失败的项目（从进度文件中）
+        
+        Args:
+            progress_files: 进度文件列表，如果为None则使用默认文件
+            requests_per_minute: 每分钟请求数
+            max_retries: 最大重试次数
+            remove_successful: 是否从失败列表中移除成功的项目
+        """
+        if progress_files is None:
+            progress_files = [
+                "cid_progress.json",
+                "sid_progress.json", 
+                "sid_backwards_progress.json"
+            ]
+        
+        self.logger.info("=== 开始重新爬取失败项目 ===")
+        self.logger.info("进度文件: %s", progress_files)
+        
+        all_failed_items = set()
+        progress_data = {}
+        
+        # 从所有进度文件中收集失败项目
+        for progress_file in progress_files:
+            if not os.path.exists(progress_file):
+                self.logger.info("进度文件不存在: %s", progress_file)
+                continue
+                
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                    progress_data[progress_file] = progress
+                    
+                    # 从CID进度文件收集失败项目
+                    if 'permanent_fails' in progress:
+                        for cid in progress['permanent_fails']:
+                            all_failed_items.add(('cid', cid))
+                    
+                    if 'retry_queue' in progress:
+                        for item in progress['retry_queue']:
+                            if isinstance(item, list) and len(item) > 0:
+                                all_failed_items.add(('cid', item[0]))
+                    
+                    # 从SID进度文件收集失败项目
+                    if 'empty_songs' in progress:
+                        for sid in progress['empty_songs']:
+                            all_failed_items.add(('sid', sid))
+                    
+                    if 'failed_songs' in progress:
+                        for sid in progress['failed_songs']:
+                            all_failed_items.add(('sid', sid))
+                            
+            except Exception as e:
+                self.logger.error("读取进度文件 %s 失败: %s", progress_file, e)
+        
+        if not all_failed_items:
+            self.logger.info("没有找到失败项目")
+            return 0, 0
+        
+        self.logger.info("找到 %d 个失败项目需要重新爬取", len(all_failed_items))
+        
+        # 计算请求间隔
+        request_interval = 60.0 / requests_per_minute
+        success_count = 0
+        total_count = len(all_failed_items)
+        
+        # 重新爬取所有失败项目
+        for i, (item_type, item_id) in enumerate(all_failed_items):
+            if stop_requested:
+                break
+                
+            self.logger.info("重新爬取 %s %d (%d/%d)", 
+                           item_type.upper(), item_id, i+1, total_count)
+            
+            result = False
+            if item_type == 'cid':
+                result = self.crawl_chart_detail_with_retry(item_id)
+            elif item_type == 'sid':
+                cids = self.get_charts_from_song_page(item_id)
+                if cids:
+                    for cid in cids:
+                        if self.crawl_chart_detail_with_retry(cid):
+                            result = True
+                            break
+            
+            if result:
+                success_count += 1
+                self.logger.info("✓ 重新爬取 %s %d 成功", item_type.upper(), item_id)
+                
+                # 从失败列表中移除成功的项目
+                if remove_successful:
+                    self._remove_from_failed_lists(progress_data, item_type, item_id)
+            else:
+                self.logger.warning("✗ 重新爬取 %s %d 失败", item_type.upper(), item_id)
+            
+            # 请求间隔
+            time.sleep(request_interval)
+        
+        # 保存更新后的进度文件
+        if remove_successful:
+            for progress_file, progress in progress_data.items():
+                try:
+                    with open(progress_file, 'w', encoding='utf-8') as f:
+                        json.dump(progress, f, ensure_ascii=False, indent=2)
+                    self.logger.info("已更新进度文件: %s", progress_file)
+                except Exception as e:
+                    self.logger.error("保存进度文件 %s 失败: %s", progress_file, e)
+        
+        self.logger.info("失败项目重新爬取完成: 成功 %d/%d", success_count, total_count)
+        return success_count, total_count
+
+    def _remove_from_failed_lists(self, progress_data, item_type, item_id):
+        """从失败列表中移除项目"""
+        for progress_file, progress in progress_data.items():
+            updated = False
+            
+            if item_type == 'cid':
+                # 从permanent_fails中移除
+                if 'permanent_fails' in progress and item_id in progress['permanent_fails']:
+                    progress['permanent_fails'].remove(item_id)
+                    updated = True
+                
+                # 从retry_queue中移除
+                if 'retry_queue' in progress:
+                    new_retry_queue = [item for item in progress['retry_queue'] 
+                                     if not (isinstance(item, list) and len(item) > 0 and item[0] == item_id)]
+                    if len(new_retry_queue) != len(progress['retry_queue']):
+                        progress['retry_queue'] = new_retry_queue
+                        updated = True
+            
+            elif item_type == 'sid':
+                # 从empty_songs中移除
+                if 'empty_songs' in progress and item_id in progress['empty_songs']:
+                    progress['empty_songs'].remove(item_id)
+                    updated = True
+                
+                # 从failed_songs中移除
+                if 'failed_songs' in progress and item_id in progress['failed_songs']:
+                    progress['failed_songs'].remove(item_id)
+                    updated = True
+            
+            if updated:
+                progress['last_save'] = datetime.now().isoformat()
+                self.logger.debug("从 %s 中移除 %s %d", progress_file, item_type, item_id)
+
     def test_api(self):
         """测试API访问"""
         try:
@@ -1967,6 +2125,15 @@ def main():
                        help='向后SID进度文件路径')
     parser.add_argument('--sid-backwards-status', action='store_true', help='显示向后SID爬取状态')
     
+    # 新增的重试失败项目参数
+    parser.add_argument('--retry-failed', action='store_true', help='重新爬取所有失败的项目')
+    parser.add_argument('--retry-rpm', type=int, default=5, help='重试时的每分钟请求数（默认5）')
+    parser.add_argument('--retry-max-retries', type=int, default=3, help='重试时的最大重试次数（默认3）')
+    parser.add_argument('--no-remove-successful', action='store_true', 
+                       help='重试成功后不从失败列表中移除')
+    parser.add_argument('--progress-files', type=str, 
+                       help='指定要处理的进度文件，逗号分隔（默认：cid_progress.json,sid_progress.json,sid_backwards_progress.json）')
+    
     args = parser.parse_args()
     
     # 设置详细日志
@@ -2024,6 +2191,22 @@ def main():
             logger.info("API测试成功")
         else:
             logger.error("API测试失败")
+        return
+    
+    # 重试失败项目模式
+    if args.retry_failed:
+        logger.info("启动重试失败项目模式")
+        progress_files = None
+        if args.progress_files:
+            progress_files = [f.strip() for f in args.progress_files.split(',')]
+        
+        success, total = crawler.retry_failed_items(
+            progress_files=progress_files,
+            requests_per_minute=args.retry_rpm,
+            max_retries=args.retry_max_retries,
+            remove_successful=not args.no_remove_successful
+        )
+        logger.info("重试失败项目完成: 成功 %d/%d", success, total)
         return
     
     # 向后SID爬取模式
